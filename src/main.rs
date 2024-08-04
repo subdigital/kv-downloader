@@ -27,7 +27,7 @@ struct Args {
         short,
         long,
         help = "Transpose the key of all tracks (i.e. -1 or 1)",
-        value_parser = clap::value_parser!(i8).range(-4..4),
+        value_parser = clap::value_parser!(i8).range(-4..=4),
         default_value = "0"
     )]
     transpose: Option<i8>,

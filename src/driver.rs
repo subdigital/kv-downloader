@@ -1,5 +1,4 @@
 use headless_chrome::{Browser, LaunchOptions, Tab};
-use std::error::Error;
 
 pub struct Config {
     pub domain: String,
