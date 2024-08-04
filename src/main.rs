@@ -1,10 +1,11 @@
 use clap::Parser;
 use dotenv::dotenv;
-use std::{env, error::Error};
+use std::{env, error::Error, thread::sleep, time::Duration};
 use tasks::download_song::DownloadOptions;
 use url;
 
 mod driver;
+mod keystore;
 mod tasks;
 
 #[derive(Parser, Debug)]
@@ -61,6 +62,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         transpose: args.transpose.or(Some(0)).unwrap(),
     };
     driver.download_song(&args.song_url, download_options)?;
+
+    sleep(Duration::from_secs(10));
 
     Ok(())
 }
