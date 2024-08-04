@@ -1,7 +1,8 @@
-use headless_chrome::{protocol::cdp::Page::CaptureScreenshotFormatOption, Element};
+use headless_chrome::{protocol::cdp::Page::CaptureScreenshotFormatOption, Element, Tab};
 
 use crate::driver::Driver;
-use std::{error::Error, time::Duration};
+use std::fmt::Display;
+use std::{error::Error, thread::sleep, time::Duration};
 
 pub struct DownloadOptions {
     pub count_in: bool,
@@ -17,12 +18,35 @@ impl Default for DownloadOptions {
     }
 }
 
+#[derive(Debug)]
+pub enum DownloadError {
+    NotPurchased,
+    NotASongPage,
+}
+impl Display for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPurchased => f.write_str("This track has not been purchased"),
+            Self::NotASongPage => f.write_str("This doesn't look like a song page. Check the url."),
+        }
+    }
+}
+impl Error for DownloadError {}
+
 impl Driver {
     pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<(), Box<dyn Error>> {
         let tab = self.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(30));
 
         tab.navigate_to(url)?.wait_until_navigated()?;
+
+        if !self.is_a_song_page(&tab) {
+            return Err(Box::new(DownloadError::NotASongPage) as Box<dyn Error>);
+        }
+
+        if !self.is_downloadable(&tab) {
+            return Err(Box::new(DownloadError::NotPurchased) as Box<dyn Error>);
+        }
 
         if options.count_in {
             let el = tab.wait_for_element("input#precount")?;
@@ -33,8 +57,28 @@ impl Driver {
 
         self.adjust_pitch(options.transpose, &tab)?;
 
+        let png_data =
+            tab.capture_screenshot(CaptureScreenshotFormatOption::Png, Some(1), None, false)?;
+        std::fs::write("screenshot.png", png_data)?;
+
         Ok(())
     }
+
+    fn is_a_song_page(&self, tab: &Tab) -> bool {
+        let has_mixer = tab.find_element("div.mixer").is_ok();
+        let has_download_button = tab.find_element("a.download").is_ok();
+        has_mixer && has_download_button
+    }
+
+    fn is_downloadable(&self, tab: &Tab) -> bool {
+        // if the download button also has the addtocart class, then this hasn't been purchased
+        let el = tab.find_element("a.download.addtocart").ok();
+        match el {
+            Some(_) => false,
+            None => true,
+        }
+    }
+
     fn adjust_pitch(&self, desired_pitch: i8, tab: &Tab) -> Result<(), Box<dyn Error>> {
         // pitch is remembered per-son on your account, so this logic cannot be deterministic. Instead
         // we''l try to infer the direction we need to go based on what the pitch is currently set to.
