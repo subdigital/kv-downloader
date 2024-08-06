@@ -98,7 +98,8 @@ impl Driver {
                     true,
                 )?
                 .value
-                .map(|v| v.to_string().replace('\n', " ").replace('"', ""))
+                // remove quotes & new lines from the extracted text
+                .map(|v| v.to_string().replace("\\n", " ").replace('"', ""))
                 .unwrap_or(String::new());
             names.push(name);
         }
