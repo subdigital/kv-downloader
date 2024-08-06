@@ -2,7 +2,6 @@ use clap::Parser;
 use dotenv::dotenv;
 use kv_downloader::{driver, tasks};
 use std::{env, error::Error, thread::sleep, time::Duration};
-use url;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about)]
@@ -55,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let download_options = tasks::download_song::DownloadOptions {
         count_in: args.count_in,
-        transpose: args.transpose.or(Some(0)).unwrap(),
+        transpose: args.transpose.unwrap_or(0),
     };
     driver.download_song(&args.song_url, download_options)?;
 

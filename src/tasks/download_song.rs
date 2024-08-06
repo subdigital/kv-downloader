@@ -4,18 +4,10 @@ use crate::driver::Driver;
 use std::fmt::Display;
 use std::{error::Error, thread::sleep, time::Duration};
 
+#[derive(Default)]
 pub struct DownloadOptions {
     pub count_in: bool,
     pub transpose: i8,
-}
-
-impl Default for DownloadOptions {
-    fn default() -> Self {
-        DownloadOptions {
-            count_in: false,
-            transpose: 0,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -23,6 +15,7 @@ pub enum DownloadError {
     NotPurchased,
     NotASongPage,
 }
+
 impl Display for DownloadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -66,7 +59,7 @@ impl Driver {
         let solo_button_sel = ".track__controls.track__solo";
         let solo_buttons = tab.find_elements(solo_button_sel)?;
         let download_button = tab.find_element("a.download")?;
-        let track_names = Driver::extract_track_names(&tab)?;
+        let track_names = Driver::extract_track_names(tab)?;
 
         tab.enable_debugger()?;
         for (index, solo_btn) in solo_buttons.iter().enumerate() {
@@ -105,7 +98,7 @@ impl Driver {
                     true,
                 )?
                 .value
-                .map(|v| v.to_string().replace("\\n", " ").replace("\"", ""))
+                .map(|v| v.to_string().replace('\n', " ").replace('"', ""))
                 .unwrap_or(String::new());
             names.push(name);
         }
@@ -122,10 +115,7 @@ impl Driver {
     fn is_downloadable(&self, tab: &Tab) -> bool {
         // if the download button also has the addtocart class, then this hasn't been purchased
         let el = tab.find_element("a.download.addtocart").ok();
-        match el {
-            Some(_) => false,
-            None => true,
-        }
+        el.is_none()
     }
 
     fn adjust_pitch(&self, desired_pitch: i8, tab: &Tab) -> Result<(), Box<dyn Error>> {
