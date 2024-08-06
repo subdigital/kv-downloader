@@ -21,6 +21,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
+      - uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: libdbus-glib-1-dev
       - run: cargo fmt --all -- --check
       - run: cargo test
       - run: cargo clippy
