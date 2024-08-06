@@ -34,7 +34,7 @@ impl Driver {
 
         if let Some(download_path) = &config.download_path {
             tracing::info!("Setting download path to: {}", download_path);
-            Driver::set_download_path(&browser, &download_path)
+            Driver::set_download_path(&browser, download_path)
                 .expect("failed to set download path");
         }
 
