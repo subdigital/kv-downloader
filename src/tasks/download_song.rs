@@ -1,4 +1,4 @@
-use headless_chrome::{protocol::cdp::Page::CaptureScreenshotFormatOption, Element, Tab};
+use headless_chrome::{Element, Tab};
 
 use crate::driver::Driver;
 use std::fmt::Display;
@@ -59,10 +59,6 @@ impl Driver {
 
         self.solo_and_download_tracks(&tab)?;
 
-        let png_data =
-            tab.capture_screenshot(CaptureScreenshotFormatOption::Png, Some(1), None, false)?;
-        std::fs::write("screenshot.png", png_data)?;
-
         Ok(())
     }
 
@@ -74,47 +70,22 @@ impl Driver {
 
         tab.enable_debugger()?;
         for (index, solo_btn) in solo_buttons.iter().enumerate() {
-            // click track also has the "intro" element, so we need to extract just the text
             let track_name = track_names[index].clone();
-            tracing::info!("track! {}", track_name);
-        }
-        tab.disable_debugger()?;
+            tracing::info!("Processing track {}", track_name);
+            solo_btn.click()?;
+            sleep(Duration::from_secs(2));
 
-        sleep(Duration::from_secs(15));
+            download_button.click()?;
+            tracing::info!("Waiting for download...");
+            sleep(Duration::from_secs(2));
+            tab.wait_for_element(".begin-download")
+                .expect("Timed out waiting for download.");
+
+            tab.find_element("button.js-modal-close")?.click()?;
+            sleep(Duration::from_secs(4));
+        }
 
         Ok(())
-        /*
-
-        const soloButtonSelector = ".track__controls.track__solo"
-        let soloButtons = await page.$$(soloButtonSelector);
-        let trackNames = await page.$$(".mixer .track .track__caption");
-
-        let i = 1;
-        let downloadButton = await page.waitForSelector("a.download");
-        for (const soloButton of soloButtons) {
-          // the click track also has the intro element, so we need to extract just the text
-          const trackName = await trackNames[i - 1].evaluate(el => el.lastChild.nodeValue.trim());
-          console.log(`soloing track ${i} of ${soloButtons.length} (${trackName})`);
-          await soloButton.click();
-          await util.sleep(3000);
-          await downloadButton.click();
-          console.log("Waiting for download...")
-          await util.sleep(3000);
-          await page.waitForSelector("text/Your download will begin in a moment");
-          await util.sleep(3000);
-
-          const closeModalButton = await page.waitForSelector("button.js-modal-close");
-          console.log("closing modal...");
-          await util.sleep(3000);
-          await closeModalButton.click();
-
-          await util.sleep(10000);
-
-          i += 1;
-        }
-
-
-        */
     }
 
     pub fn extract_track_names(tab: &Tab) -> Result<Vec<String>, Box<dyn Error>> {

@@ -1,14 +1,10 @@
 mod server;
 
-use headless_chrome::Browser;
 use std::error::Error;
 
 use server::Server;
 
-use kv_downloader::{
-    driver::{Config, Driver},
-    tasks::download_song::DownloadOptions,
-};
+use kv_downloader::driver::{Config, Driver};
 
 #[test]
 fn extracts_track_names() -> Result<(), Box<dyn Error>> {
