@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = driver::Config {
         domain: extract_domain_from_url(&args.song_url).expect("missing domain from url"),
         headless: args.headless,
-        ..Default::default()
+        download_path: args.download_path,
     };
     let driver = driver::Driver::new(config);
     driver.sign_in(&user, &pass)?;

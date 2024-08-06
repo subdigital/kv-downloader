@@ -1,4 +1,5 @@
 use headless_chrome::{Browser, LaunchOptions, Tab};
+use std::error::Error;
 
 pub struct Config {
     pub domain: String,
@@ -25,13 +26,34 @@ impl Driver {
     pub fn new(config: Config) -> Self {
         let browser = Browser::new(LaunchOptions {
             headless: config.headless,
-            window_size: Some((1024, 768)),
+            window_size: Some((1440, 1200)),
             enable_logging: true,
             ..Default::default()
         })
-        .expect("Unable to create headless chrome browser");
+        .expect("Unable to create headless chromium browser");
+
+        if let Some(download_path) = &config.download_path {
+            tracing::info!("Setting download path to: {}", download_path);
+            Driver::set_download_path(&browser, &download_path)
+                .expect("failed to set download path");
+        }
 
         Driver { config, browser }
+    }
+
+    fn set_download_path(browser: &Browser, download_path: &str) -> Result<(), Box<dyn Error>> {
+        let tabs = browser.get_tabs().lock().unwrap();
+
+        let tab = tabs.first().expect("failed to get initial tab");
+        let download_behavior_method = headless_chrome::protocol::cdp::Browser::SetDownloadBehavior {
+            browser_context_id: None,
+            behavior: headless_chrome::protocol::cdp::Browser::SetDownloadBehaviorBehaviorOption::Allow,
+            download_path: Some(download_path.to_string()),
+            events_enabled: None
+        };
+        tab.call_method(download_behavior_method)?;
+
+        Ok(())
     }
 
     pub fn type_fast(&self, tab: &Tab, text: &str) {
