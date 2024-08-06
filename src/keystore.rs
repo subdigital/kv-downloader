@@ -2,10 +2,13 @@ use headless_chrome::protocol::cdp::Network::{Cookie, CookieParam};
 use keyring::Entry;
 use std::error::Error;
 
+#[allow(dead_code)]
 pub struct Keystore {}
 
+#[allow(dead_code)]
 const KEYSTORE_SERVICE: &str = "kv-downloader";
 
+#[allow(dead_code)]
 impl Keystore {
     pub fn get_auth_cookie(user: &str) -> Result<CookieParam, Box<dyn Error>> {
         let secret = Entry::new(KEYSTORE_SERVICE, user)?.get_secret()?;

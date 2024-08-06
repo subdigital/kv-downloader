@@ -57,11 +57,89 @@ impl Driver {
 
         self.adjust_pitch(options.transpose, &tab)?;
 
+        self.solo_and_download_tracks(&tab)?;
+
         let png_data =
             tab.capture_screenshot(CaptureScreenshotFormatOption::Png, Some(1), None, false)?;
         std::fs::write("screenshot.png", png_data)?;
 
         Ok(())
+    }
+
+    fn solo_and_download_tracks(&self, tab: &Tab) -> Result<(), Box<dyn Error>> {
+        let solo_button_sel = ".track__controls.track__solo";
+        let solo_buttons = tab.find_elements(solo_button_sel)?;
+        let download_button = tab.find_element("a.download")?;
+        let track_names = Driver::extract_track_names(&tab)?;
+
+        tab.enable_debugger()?;
+        for (index, solo_btn) in solo_buttons.iter().enumerate() {
+            // click track also has the "intro" element, so we need to extract just the text
+            let track_name = track_names[index].clone();
+            tracing::info!("track! {}", track_name);
+        }
+        tab.disable_debugger()?;
+
+        sleep(Duration::from_secs(15));
+
+        Ok(())
+        /*
+
+        const soloButtonSelector = ".track__controls.track__solo"
+        let soloButtons = await page.$$(soloButtonSelector);
+        let trackNames = await page.$$(".mixer .track .track__caption");
+
+        let i = 1;
+        let downloadButton = await page.waitForSelector("a.download");
+        for (const soloButton of soloButtons) {
+          // the click track also has the intro element, so we need to extract just the text
+          const trackName = await trackNames[i - 1].evaluate(el => el.lastChild.nodeValue.trim());
+          console.log(`soloing track ${i} of ${soloButtons.length} (${trackName})`);
+          await soloButton.click();
+          await util.sleep(3000);
+          await downloadButton.click();
+          console.log("Waiting for download...")
+          await util.sleep(3000);
+          await page.waitForSelector("text/Your download will begin in a moment");
+          await util.sleep(3000);
+
+          const closeModalButton = await page.waitForSelector("button.js-modal-close");
+          console.log("closing modal...");
+          await util.sleep(3000);
+          await closeModalButton.click();
+
+          await util.sleep(10000);
+
+          i += 1;
+        }
+
+
+        */
+    }
+
+    pub fn extract_track_names(tab: &Tab) -> Result<Vec<String>, Box<dyn Error>> {
+        let track_names = tab.find_elements(".mixer .track .track__caption")?;
+        let mut names: Vec<String> = vec![];
+        for el in track_names {
+            // the name may contain other child nodes, so we'll execute a js function
+            // to just grab the last child, which is the text.
+            let name: String = el
+                .call_js_fn(
+                    r#"
+                    function get_name() {
+                        return this.lastChild.nodeValue.trim();
+                    }
+                    "#,
+                    vec![],
+                    true,
+                )?
+                .value
+                .map(|v| v.to_string().replace("\\n", " ").replace("\"", ""))
+                .unwrap_or(String::new());
+            names.push(name);
+        }
+
+        Ok(names)
     }
 
     fn is_a_song_page(&self, tab: &Tab) -> bool {
@@ -83,7 +161,7 @@ impl Driver {
         // pitch is remembered per-son on your account, so this logic cannot be deterministic. Instead
         // we''l try to infer the direction we need to go based on what the pitch is currently set to.
         let pitch_label = tab
-            .wait_for_element("span.pitch__value")
+            .find_element("span.pitch__value")
             .expect("can't find pitch value");
         let pitch_up_btn = tab
             .find_element("div.pitch button.btn--pitch[title='Key Up']")
@@ -133,11 +211,11 @@ impl Driver {
         }
 
         // need to reload the song after pitching
+        tracing::info!("Reloading tracks after pitching...");
         tab.find_element("a#pitch-link")
             .expect("can't find pitch link")
             .click()?;
 
-        tracing::info!("Reloading tracks after pitching...");
         sleep(Duration::from_secs(4));
 
         Ok(())
