@@ -64,18 +64,21 @@ impl Driver {
         tab.enable_debugger()?;
         for (index, solo_btn) in solo_buttons.iter().enumerate() {
             let track_name = track_names[index].clone();
-            tracing::info!("Processing track {}", track_name);
+            tracing::info!("Processing track {} '{}'", index + 1, track_name);
             solo_btn.click()?;
             sleep(Duration::from_secs(2));
 
+            tracing::info!("- starting download...");
             download_button.click()?;
-            tracing::info!("Waiting for download...");
             sleep(Duration::from_secs(2));
+
+            tracing::info!("- waiting for download...");
             tab.wait_for_element(".begin-download")
                 .expect("Timed out waiting for download.");
 
             tab.find_element("button.js-modal-close")?.click()?;
             sleep(Duration::from_secs(4));
+            tracing::info!("- '{}' complete!", track_name);
         }
 
         Ok(())

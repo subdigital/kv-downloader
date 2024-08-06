@@ -29,14 +29,22 @@ struct Args {
 
     #[arg(short, long, help = "Whether to count in an intro for all tracks")]
     count_in: bool,
+
+    #[arg(long, help = "Enable debug logs")]
+    debug: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
     let args = Args::parse();
+
+    tracing_subscriber::fmt()
+        .with_max_level(if args.debug {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        })
+        .init();
     tracing::debug!(args = format!("cli args: {:?}", args));
 
     let user = env::var("KV_USERNAME")
