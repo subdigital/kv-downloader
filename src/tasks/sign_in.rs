@@ -1,10 +1,8 @@
 use crate::driver::Driver;
-// use crate::keystore::Keystore;
-use std::error::Error;
-// use std::thread::sleep;
+use anyhow::Result;
 
 impl Driver {
-    pub fn sign_in(&self, user: &str, pass: &str) -> Result<(), Box<dyn Error>> {
+    pub fn sign_in(&self, user: &str, pass: &str) -> Result<()> {
         let tab = self.browser.new_tab()?;
 
         // navigate to the homepage
@@ -47,6 +45,7 @@ impl Driver {
 
         // if we don't have a login link, we're already signed in (from a cookie)
         if login_link.is_none() {
+            tracing::info!(user = user, "Already signed in");
             return Ok(());
         }
 

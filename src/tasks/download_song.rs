@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use headless_chrome::{Element, Tab};
 
 use crate::driver::Driver;
@@ -27,18 +28,18 @@ impl Display for DownloadError {
 impl Error for DownloadError {}
 
 impl Driver {
-    pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<(), Box<dyn Error>> {
+    pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<()> {
         let tab = self.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(30));
 
         tab.navigate_to(url)?.wait_until_navigated()?;
 
         if !self.is_a_song_page(&tab) {
-            return Err(Box::new(DownloadError::NotASongPage) as Box<dyn Error>);
+            return Err(anyhow!(DownloadError::NotASongPage));
         }
 
         if !self.is_downloadable(&tab) {
-            return Err(Box::new(DownloadError::NotPurchased) as Box<dyn Error>);
+            return Err(anyhow!(DownloadError::NotPurchased));
         }
 
         if options.count_in {
@@ -55,7 +56,7 @@ impl Driver {
         Ok(())
     }
 
-    fn solo_and_download_tracks(&self, tab: &Tab) -> Result<(), Box<dyn Error>> {
+    fn solo_and_download_tracks(&self, tab: &Tab) -> Result<()> {
         let solo_button_sel = ".track__controls.track__solo";
         let solo_buttons = tab.find_elements(solo_button_sel)?;
         let download_button = tab.find_element("a.download")?;
@@ -84,7 +85,7 @@ impl Driver {
         Ok(())
     }
 
-    pub fn extract_track_names(tab: &Tab) -> Result<Vec<String>, Box<dyn Error>> {
+    pub fn extract_track_names(tab: &Tab) -> Result<Vec<String>> {
         let track_names = tab.find_elements(".mixer .track .track__caption")?;
         let mut names: Vec<String> = vec![];
         for el in track_names {
@@ -122,7 +123,7 @@ impl Driver {
         el.is_none()
     }
 
-    fn adjust_pitch(&self, desired_pitch: i8, tab: &Tab) -> Result<(), Box<dyn Error>> {
+    fn adjust_pitch(&self, desired_pitch: i8, tab: &Tab) -> Result<()> {
         // pitch is remembered per-son on your account, so this logic cannot be deterministic. Instead
         // we''l try to infer the direction we need to go based on what the pitch is currently set to.
         let pitch_label = tab

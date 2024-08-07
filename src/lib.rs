@@ -1,3 +1,4 @@
 pub mod driver;
-mod keystore;
+pub mod keystore;
+pub mod prompt;
 pub mod tasks;
