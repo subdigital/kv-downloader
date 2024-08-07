@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use dotenv::dotenv;
+use keystore::Credentials;
+use std::env;
 use std::{thread::sleep, time::Duration};
 
 use kv_downloader::{driver, tasks};
@@ -68,7 +70,8 @@ fn main() -> Result<()> {
 }
 
 fn start_download(args: DownloadArgs) -> Result<()> {
-    let credentials = keystore::Keystore::get_credentials()
+    let credentials = credentials_from_env()
+        .ok_or(keystore::Keystore::get_credentials())
         .map_err(|_| anyhow!("Must call `kv-downloader auth` first"))?;
 
     tracing_subscriber::fmt()
@@ -79,11 +82,6 @@ fn start_download(args: DownloadArgs) -> Result<()> {
         })
         .init();
     tracing::debug!(args = format!("cli args: {:?}", args));
-
-    // let user = env::var("KV_USERNAME")
-    //     .expect("Requires KV_USERNAME env variable. Did you add this to your .env file?");
-    // let pass = env::var("KV_PASSWORD")
-    //     .expect("Requires KV_PASSWORD env variable. Did you add this to your .env file?");
 
     let config = driver::Config {
         domain: extract_domain_from_url(&args.song_url).expect("missing domain from url"),
@@ -126,4 +124,13 @@ fn start_auth() -> Result<()> {
     _ = keystore::Keystore::login(&user, &pass);
 
     Ok(())
+}
+
+fn credentials_from_env() -> Option<Credentials> {
+    env::var("KV_USERNAME")
+        .and_then(|user| match env::var("KV_PASSWORD") {
+            Ok(password) => Ok(Credentials { user, password }),
+            Err(e) => Err(e),
+        })
+        .ok()
 }
