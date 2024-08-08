@@ -1,5 +1,7 @@
 # kv-downloader
 
+[![CI](https://github.com/subdigital/kv-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/subdigital/kv-downloader/actions/workflows/ci.yml)
+
 This is a small utility that automates a workflow for downloading individual tracks from Karaoke Version.
 
 This workflow is specific to how I use this service. If you want to change it you're welcome to fork this
