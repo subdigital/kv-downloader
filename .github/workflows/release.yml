@@ -28,5 +28,5 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           dry-run: true
-          bin: target/release/kv_downloader
+          bin: kv_downloader
           token: ${{ secrets.GITHUB_TOKEN }}
