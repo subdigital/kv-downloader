@@ -74,23 +74,6 @@ I would hate for anyone's account to get banned for abusing automation like this
 
 And Karaoke Version, if you're listening: We'd love if this was fully supported in the UI!
 
-## Changelog
-
-## 0.3.0
-
-- Rewritten in Rust (mostly for practice, but also for easier maintenance on my part)
-
-## 0.2
-
-- Fixed usage of karaoke-version.co.uk
-- Added `-d` to change download path
-- Added `-h` for headless mode
-- Added `-p` for pitch changes
-
-## 0.1
-
-Initial release
-
 ## License
 
 This source code is released under the MIT license.
