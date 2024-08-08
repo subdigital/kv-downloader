@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0
+## 0.3.0-alpha
 
 - Now called "kv_downloader"
 - Rewritten in Rust (mostly for practice, but also for easier maintenance on my part)
