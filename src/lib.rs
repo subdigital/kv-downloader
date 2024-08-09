@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod driver;
 pub mod keystore;
 pub mod prompt;
