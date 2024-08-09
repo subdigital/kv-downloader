@@ -1,3 +1,5 @@
+use std::{thread::sleep, time::Duration};
+
 use crate::driver::Driver;
 use anyhow::Result;
 
@@ -70,6 +72,8 @@ impl Driver {
             .click()?;
 
         tab.wait_until_navigated()?;
+
+        sleep(Duration::from_secs(2));
 
         // save cookie for next time
         // let cookies = tab.get_cookies()?;
