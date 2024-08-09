@@ -36,9 +36,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: awalsh128/cache-apt-pkgs-action@latest
+      - uses: actions-rs/toolchain@v1
         with:
-          packages: libdbus-glib-1-dev
+          toolchain: stable
+          override: true
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: kv_downloader
