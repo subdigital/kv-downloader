@@ -11,6 +11,6 @@ pub fn prompt(msg: &str, secure: bool) -> Result<String> {
     } else {
         let mut buf = String::new();
         stdin().read_line(&mut buf)?;
-        Ok(buf)
+        Ok(buf.trim().to_string())
     }
 }
