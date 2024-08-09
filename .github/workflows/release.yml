@@ -30,6 +30,5 @@ jobs:
           packages: libdbus-glib-1-dev
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          dry-run: true
           bin: kv_downloader
           token: ${{ secrets.GITHUB_TOKEN }}
