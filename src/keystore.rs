@@ -1,14 +1,14 @@
 use anyhow::Result;
 use headless_chrome::protocol::cdp::Network::{Cookie, CookieParam};
 use keyring::Entry;
+use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)]
 pub struct Keystore {}
 
 const KEYSTORE_SERVICE: &str = "kv-downloader";
-const KV_USERNAME_KEY: &str = "KV_USERNAME";
-const KV_PASSWORD_KEY: &str = "KV_PASSWORD";
+const KV_CREDENTIALS_KEY: &str = "KV_CREDENTIALS";
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Credentials {
     pub user: String,
     pub password: String,
@@ -16,30 +16,27 @@ pub struct Credentials {
 
 impl Keystore {
     pub fn login(user: &str, password: &str) -> Result<Credentials> {
-        Entry::new(KEYSTORE_SERVICE, KV_USERNAME_KEY)?.set_password(user)?;
-        Entry::new(KEYSTORE_SERVICE, KV_PASSWORD_KEY)?.set_password(password)?;
-        Ok(Credentials {
+        let creds = Credentials {
             user: user.to_string(),
             password: password.to_string(),
-        })
+        };
+        let encoded_data = serde_json::to_vec(&creds)?;
+        Entry::new(KEYSTORE_SERVICE, KV_CREDENTIALS_KEY)?.set_secret(&encoded_data)?;
+        Ok(creds)
     }
 
     pub fn logout() -> Result<()> {
-        let user_entry = Entry::new(KEYSTORE_SERVICE, KV_PASSWORD_KEY)?;
-        if let Ok(user) = user_entry.get_password() {
-            Entry::new(KEYSTORE_SERVICE, &user)?.delete_credential()?;
+        if let Ok(entry) = Entry::new(KEYSTORE_SERVICE, KV_CREDENTIALS_KEY) {
+            let _ = entry.delete_credential().ok();
         }
-        user_entry.delete_credential()?;
-        Entry::new(KEYSTORE_SERVICE, KV_USERNAME_KEY)?.delete_credential()?;
-        Entry::new(KEYSTORE_SERVICE, KV_PASSWORD_KEY)?.delete_credential()?;
         Ok(())
     }
 
     pub fn get_credentials() -> Result<Credentials> {
-        Ok(Credentials {
-            user: Entry::new(KEYSTORE_SERVICE, KV_USERNAME_KEY)?.get_password()?,
-            password: Entry::new(KEYSTORE_SERVICE, KV_PASSWORD_KEY)?.get_password()?,
-        })
+        let entry = Entry::new(KEYSTORE_SERVICE, KV_CREDENTIALS_KEY)?;
+        let encoded_data = entry.get_secret()?;
+        let creds: Credentials = serde_json::from_slice(&encoded_data)?;
+        Ok(creds)
     }
 
     #[allow(dead_code)]
