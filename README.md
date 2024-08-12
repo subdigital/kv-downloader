@@ -26,7 +26,34 @@ I like to set up my own mix for backing tracks using Logic. For maximum flexibil
 
 ## Installation & Set Up
 
-(todo)
+Look at the Releases page’s assets for the latest version of the app. Download the appropriate version for your platform,
+uncompress it, and put it somewhere in your PATH.
+
+> [!IMPORTANT]
+> Note for macOS: Gatekeeper may block the app from running. In order to run this, navigate to Privacy & Security in System Preferences, and click the "Open Anyway" button.
+
+Run `kv_downloader auth` to provide your credentials. You only need to do this once.
+
+> [!NOTE]
+> Your credentials are stored securely by your operating system's keychain. They are not sent anywhere _except_ to the Karaoke Version website.
+
+## Usage
+
+First, you have to purchase the track in your Karaoke Version account. Copy the URL of the song you want.
+
+Then run `kv_downloader <song url>`. You can also pass options to customize the behavior:
+
+## Options
+
+- `-d <path>` - Change the download location
+-  `-h` or `--headless` - Use headless mode, which hides the UI.
+-  `-p <pitch offset>` - Change the pitch of the downloaded tracks (-1 to go down half step, 1 to go up half step, etc)
+- `--count-in` - Include the intro precount on all tracks
+- `--debug` - Enable debug logging (in case something goes wrong this helps give more detail)
+
+Using headless mode may make it less clear what is going on behind the scenes, so I suggest testing it out
+in the regular mode first.
+
 
 ## Build and Run from Source
 
@@ -42,26 +69,9 @@ KV_PASSWORD=<yourpassword>
 
 - type `cargo run -- --help` (note the double dashes to separate the args from the cargo command)
 
-## Usage
+Usage is the same as above, except you'll be typing `cargo run --` instead of `kv_downloader`.
 
-First, you have to purchase the track in your Karaoke Version account. Copy the URL
-of the song you want.
-
-Then run `cargo run -- <song url>`.
-
-## Options
-
-- `-d <path>` - Change the download location
--  `-h` or `--headless` - Use headless mode, which hides the UI.
--  `-p <pitch offset>` - Change the pitch of the downloaded tracks (-1 to go down half step, 1 to go up half step, etc)
-- `--count-in` - Include the intro precount on all tracks
-- `--debug` - Enable debug logging (in case something goes wrong this helps give more detail)
-
-Using headless mode may make it less clear what is going on behind the scenes, so I suggest testing it out
-in the regular mode first.
-
-To pass these flags, you'll have to separate the `cargo run` command from the arguments
-with `--`, for example:
+For example:
 
 ```
 cargo run -- <song url> -d my_song_dir --count-in
