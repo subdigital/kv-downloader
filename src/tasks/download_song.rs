@@ -1,7 +1,7 @@
+use crate::driver::Driver;
+
 use anyhow::{anyhow, Result};
 use headless_chrome::{Element, Tab};
-
-use crate::driver::Driver;
 use std::fmt::Display;
 use std::{error::Error, thread::sleep, time::Duration};
 
@@ -32,13 +32,34 @@ impl Driver {
         let tab = self.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(30));
 
+        // tab.add_event_listener(Arc::new(move |event: &Event| match event {
+        //     Event::PageScreencastFrame(frame_event) => {
+        //         let bytes = BASE64_STANDARD
+        //             .decode(frame_event.params.data.clone())
+        //             .unwrap();
+        //         let ts = frame_event.params.metadata.timestamp.unwrap();
+        //         std::fs::write(format!("screencast-{}.jpg", ts), &bytes).unwrap();
+        //     }
+        //     _ => {}
+        // }))?;
+
+        // tab.start_screencast(
+        //     Some(StartScreencastFormatOption::Jpeg),
+        //     Some(80),
+        //     Some(1280),
+        //     Some(720),
+        //     Some(4),
+        // )?;
+
         tab.navigate_to(url)?.wait_until_navigated()?;
 
         if !self.is_a_song_page(&tab) {
+            tab.stop_screencast()?;
             return Err(anyhow!(DownloadError::NotASongPage));
         }
 
         if !self.is_downloadable(&tab) {
+            tab.stop_screencast()?;
             return Err(anyhow!(DownloadError::NotPurchased));
         }
 
@@ -53,6 +74,8 @@ impl Driver {
 
         self.solo_and_download_tracks(&tab)?;
 
+        tab.stop_screencast()?;
+
         Ok(())
     }
 
@@ -63,24 +86,34 @@ impl Driver {
         let track_names = Driver::extract_track_names(tab)?;
 
         tab.enable_debugger()?;
+        sleep(Duration::from_secs(2));
         for (index, solo_btn) in solo_buttons.iter().enumerate() {
             let track_name = track_names[index].clone();
             tracing::info!("Processing track {} '{}'", index + 1, track_name);
+            solo_btn.scroll_into_view()?;
+            sleep(Duration::from_secs(2));
             solo_btn.click()?;
             sleep(Duration::from_secs(2));
 
             tracing::info!("- starting download...");
+            download_button.scroll_into_view()?;
+            sleep(Duration::from_secs(2));
             download_button.click()?;
             sleep(Duration::from_secs(2));
 
-            tracing::info!("- waiting for download...");
+            tracing::info!("- waiting for download modal...");
             tab.wait_for_element(".begin-download")
-                .expect("Timed out waiting for download.");
+                .expect("Timed out waiting for download modal.");
 
             tab.find_element("button.js-modal-close")?.click()?;
             sleep(Duration::from_secs(4));
             tracing::info!("- '{}' complete!", track_name);
         }
+
+        tracing::info!(
+            "Done! Check your download folder to make sure you have all of these tracks: {:?}\n - ",
+            track_names.join("\n - ")
+        );
 
         Ok(())
     }
