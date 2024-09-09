@@ -1,11 +1,12 @@
 # Changelog
 
-## 0.3.0-alpha
+## 0.3.0
 
 - Now called "kv_downloader"
 - Rewritten in Rust (mostly for practice, but also for easier maintenance on my part)
 - Credentials now stored in OS-specific keychain. Login with `kv_downloader auth`. Clear credentials
 with `kv_downloader logout`.
+- Session cookie is saved and used for use on subsequent runs.
 
 ---
 
