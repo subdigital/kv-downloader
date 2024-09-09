@@ -7,6 +7,7 @@ pub struct Keystore {}
 
 const KEYSTORE_SERVICE: &str = "kv-downloader";
 const KV_CREDENTIALS_KEY: &str = "KV_CREDENTIALS";
+const KV_SESSION_COOKIE_KEY: &str = "KV_SESSION";
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Credentials {
@@ -39,9 +40,8 @@ impl Keystore {
         Ok(creds)
     }
 
-    #[allow(dead_code)]
-    pub fn get_auth_cookie(user: &str) -> Result<CookieParam> {
-        let secret = Entry::new(KEYSTORE_SERVICE, user)?.get_secret()?;
+    pub fn get_auth_cookie() -> Result<CookieParam> {
+        let secret = Entry::new(KEYSTORE_SERVICE, KV_SESSION_COOKIE_KEY)?.get_secret()?;
         let cookie: Cookie = serde_json::from_slice(&secret).expect("Unable to deserialize cookie");
 
         // return a cookie param so it can be set on the tab type (get/set use differnet types)
@@ -65,10 +65,9 @@ impl Keystore {
         Ok(cookie_param)
     }
 
-    #[allow(dead_code)]
-    pub fn set_auth_cookie(user: &str, cookie: &Cookie) -> Result<()> {
+    pub fn set_auth_cookie(cookie: &Cookie) -> Result<()> {
         let value = serde_json::to_vec_pretty(&cookie).expect("Unable to serialize cookie");
-        Entry::new(KEYSTORE_SERVICE, user)?.set_secret(&value)?;
+        Entry::new(KEYSTORE_SERVICE, KV_SESSION_COOKIE_KEY)?.set_secret(&value)?;
         Ok(())
     }
 }

@@ -1,3 +1,4 @@
+use crate::keystore::Keystore;
 use std::{thread::sleep, time::Duration};
 
 use crate::driver::Driver;
@@ -12,32 +13,33 @@ impl Driver {
             .wait_until_navigated()?;
 
         // this doesn't seem to work yet...
-        // if let Some(cookie) = Keystore::get_auth_cookie(user).ok() {
-        //     tracing::debug!("Cookies before:");
-        //     for c in tab.get_cookies()? {
-        //         tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");
-        //     }
+        if let Some(cookie) = Keystore::get_auth_cookie().ok() {
+            tracing::debug!("Cookies before:");
+            for c in tab.get_cookies()? {
+                tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");
+            }
 
-        //     tracing::info!("Using previous cookie value");
-        //     tracing::debug!(
-        //         cookie = serde_json::to_string(&cookie).unwrap(),
-        //         "Cookie value"
-        //     );
+            tracing::info!("Using previous cookie value");
+            tracing::debug!(cookie = serde_json::to_string(&cookie).unwrap());
 
-        //     // only set it if it's an authenticated session with a user id?
-        //     if cookie.value.contains("|u-i:") {
-        //         tab.set_cookies(vec![cookie])
-        //             .expect("unable to set cookies");
-        //         tab.reload(true, None)?;
+            // only set it if it's an authenticated session with a user id?
+            if cookie.value.contains("|u-i:") {
+                tracing::debug!("Setting cookie");
+                tab.set_cookies(vec![cookie])
+                    .expect("unable to set cookies");
+                tracing::debug!("Reloading tab...");
+                tab.reload(true, None)?;
 
-        //         tracing::debug!("Cookies after:");
-        //         for c in tab.get_cookies()? {
-        //             tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");
-        //         }
-        //     }
+                sleep(Duration::from_secs(2));
 
-        //     // continue to check for login link in case this cookie isn't valid anymore
-        // }
+                tracing::debug!("Cookies after:");
+                for c in tab.get_cookies()? {
+                    tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");
+                }
+            }
+
+            // continue to check for login link in case this cookie isn't valid anymore
+        }
 
         tracing::info!(user = user, "Logging in user");
 
@@ -55,7 +57,6 @@ impl Driver {
         login_link.unwrap().click()?;
 
         // fill out form
-        // tab.wait_for_element("#frm_login")?.type_into(user)?;
         tab.wait_for_element("#frm_login")
             .expect("couldn't find username input")
             .focus()?;
@@ -76,15 +77,15 @@ impl Driver {
         sleep(Duration::from_secs(2));
 
         // save cookie for next time
-        // let cookies = tab.get_cookies()?;
-        // if let Some(session_cookie) = cookies.iter().find(|c| c.name == "karaoke-version") {
-        //     tracing::info!("Saving session cookie for next time");
-        //     tracing::debug!(
-        //         cookie = format!("{}: {}", session_cookie.name, session_cookie.value),
-        //         "🍪"
-        //     );
-        //     Keystore::set_auth_cookie(user, session_cookie)?;
-        // }
+        let cookies = tab.get_cookies()?;
+        if let Some(session_cookie) = cookies.iter().find(|c| c.name == "karaoke-version") {
+            tracing::info!("Saving session cookie for next time");
+            tracing::debug!(
+                cookie = format!("{}: {}", session_cookie.name, session_cookie.value),
+                "🍪"
+            );
+            Keystore::set_auth_cookie(session_cookie)?;
+        }
 
         Ok(())
     }
