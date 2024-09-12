@@ -44,7 +44,15 @@ impl Driver {
     fn set_download_path(browser: &Browser, download_path: &str) -> Result<(), Box<dyn Error>> {
         let tabs = browser.get_tabs().lock().unwrap();
 
-        let tab = tabs.first().expect("failed to get initial tab");
+        let tab = tabs
+            .first()
+            .unwrap_or(
+                &browser
+                    .new_tab()
+                    .expect("couldn't open a new tab to set download behavior"),
+            )
+            .to_owned();
+
         let download_behavior_method = headless_chrome::protocol::cdp::Browser::SetDownloadBehavior {
             browser_context_id: None,
             behavior: headless_chrome::protocol::cdp::Browser::SetDownloadBehaviorBehaviorOption::Allow,
