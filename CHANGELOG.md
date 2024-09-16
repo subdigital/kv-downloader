@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- Fixed hang while specifying a download path
+- Headless mode now works when specying a download path
+
 ## 0.3.0
 
 - Now called "kv_downloader"
