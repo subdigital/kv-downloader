@@ -42,16 +42,9 @@ impl Driver {
     }
 
     fn set_download_path(browser: &Browser, download_path: &str) -> Result<(), Box<dyn Error>> {
-        let tabs = browser.get_tabs().lock().unwrap();
-
-        let tab = tabs
-            .first()
-            .unwrap_or(
-                &browser
-                    .new_tab()
-                    .expect("couldn't open a new tab to set download behavior"),
-            )
-            .to_owned();
+        let tab = browser
+            .new_tab()
+            .expect("couldn't open a new tab to set download behavior");
 
         let download_behavior_method = headless_chrome::protocol::cdp::Browser::SetDownloadBehavior {
             browser_context_id: None,
@@ -59,6 +52,7 @@ impl Driver {
             download_path: Some(download_path.to_string()),
             events_enabled: None
         };
+        tracing::debug!("call_method (set download behavior)");
         tab.call_method(download_behavior_method)?;
 
         Ok(())
