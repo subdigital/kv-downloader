@@ -163,10 +163,10 @@ impl Driver {
             .find_element("span.pitch__value")
             .expect("can't find pitch value");
         let pitch_up_btn = tab
-            .find_element("div.pitch button.btn--pitch[title='Key Up']")
+            .find_element("div.pitch button.btn--pitch[title='Key up' i]")
             .expect("can't find pitch up button");
         let pitch_down_btn = tab
-            .find_element("div.pitch button.btn--pitch[title='Key Down']")
+            .find_element("div.pitch button.btn--pitch[title='Key down' i]")
             .expect("can't find pitch down button");
 
         pitch_up_btn.focus()?;
