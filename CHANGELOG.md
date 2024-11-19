@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2
+
+- Fixed UK downloads by making title matching case insensitive
+
 ## 0.3.1
 
 - Fixed hang while specifying a download path
