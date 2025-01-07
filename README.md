@@ -47,7 +47,7 @@ Then run `kv_downloader <song url>`. You can also pass options to customize the 
 
 - `-d <path>` - Change the download location
 -  `-h` or `--headless` - Use headless mode, which hides the UI.
--  `-p <pitch offset>` - Change the pitch of the downloaded tracks (-1 to go down half step, 1 to go up half step, etc)
+-  `-t <transpose offset>` - Change the pitch of the downloaded tracks (-1 to go down half step, 1 to go up half step, etc)
 - `--count-in` - Include the intro precount on all tracks
 - `--debug` - Enable debug logging (in case something goes wrong this helps give more detail)
 
