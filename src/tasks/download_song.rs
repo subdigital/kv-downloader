@@ -64,7 +64,7 @@ impl Driver {
         }
 
         if options.count_in {
-            let el = tab.wait_for_element("input#precount")?;
+            let el = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(15))?;
             if !el.is_checked() {
                 el.click()?;
             }
@@ -102,7 +102,7 @@ impl Driver {
             sleep(Duration::from_secs(2));
 
             tracing::info!("- waiting for download modal...");
-            tab.wait_for_element(".begin-download")
+            tab.wait_for_element_with_custom_timeout(".begin-download", Duration::from_secs(60))
                 .expect("Timed out waiting for download modal.");
 
             tab.find_element("button.js-modal-close")?.click()?;
