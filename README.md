@@ -74,7 +74,7 @@ Usage is the same as above, except you'll be typing `cargo run --` instead of `k
 For example:
 
 ```
-cargo run -- <song url> -d my_song_dir --count-in
+cargo run -- download <song url> -d my_song_dir --count-in
 ```
 
 ## Use at your own risk
