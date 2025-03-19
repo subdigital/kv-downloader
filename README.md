@@ -41,7 +41,7 @@ Run `kv_downloader auth` to provide your credentials. You only need to do this o
 
 First, you have to purchase the track in your Karaoke Version account. Copy the URL of the song you want.
 
-Then run `kv_downloader <song url>`. You can also pass options to customize the behavior:
+Then run `kv_downloader download <song url>`. You can also pass options to customize the behavior:
 
 ## Options
 
