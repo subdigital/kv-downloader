@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4
+## 0.4.0
 
 - Add a metadata file to track progress of downloads, allow a second run to continue where you left off
 - Add retry logic for individual tracks with increasing backoff logic
