@@ -29,6 +29,9 @@ impl Error for DownloadError {}
 
 impl Driver {
     pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<()> {
+        // Set the URL in progress tracking
+        self.progress.set_url(url)?;
+        
         let tab = self.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(30));
 
@@ -87,34 +90,109 @@ impl Driver {
 
         tab.enable_debugger()?;
         sleep(Duration::from_secs(2));
+        
+        let mut failed_tracks = Vec::new();
+        
         for (index, solo_btn) in solo_buttons.iter().enumerate() {
             let track_name = track_names[index].clone();
+            
+            // Check if track was already downloaded
+            if self.progress.is_track_downloaded(&track_name)? {
+                tracing::info!("Skipping track {} '{}' (already downloaded)", index + 1, track_name);
+                continue;
+            }
+            
             tracing::info!("Processing track {} '{}'", index + 1, track_name);
-            solo_btn.scroll_into_view()?;
-            sleep(Duration::from_secs(2));
-            solo_btn.click()?;
-            sleep(Duration::from_secs(2));
-
-            tracing::info!("- starting download...");
-            download_button.scroll_into_view()?;
-            sleep(Duration::from_secs(2));
-            download_button.click()?;
-            sleep(Duration::from_secs(2));
-
-            tracing::info!("- waiting for download modal...");
-            tab.wait_for_element_with_custom_timeout(".begin-download", Duration::from_secs(60))
-                .expect("Timed out waiting for download modal.");
-
-            tab.find_element("button.js-modal-close")?.click()?;
-            sleep(Duration::from_secs(4));
-            tracing::info!("- '{}' complete!", track_name);
+            
+            // Try downloading with retries
+            let mut attempts = 0;
+            let max_attempts = 3;
+            let mut download_successful = false;
+            
+            while attempts < max_attempts && !download_successful {
+                attempts += 1;
+                
+                match self.download_single_track(tab, solo_btn, &download_button, &track_name, attempts) {
+                    Ok(_) => {
+                        download_successful = true;
+                        self.progress.mark_track_downloaded(&track_name)?;
+                        tracing::info!("- '{}' complete!", track_name);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Attempt {} failed for '{}': {}", attempts, track_name, e);
+                        if attempts < max_attempts {
+                            let wait_time = Duration::from_secs(5 * attempts as u64);
+                            tracing::info!("Waiting {:?} before retry...", wait_time);
+                            sleep(wait_time);
+                        }
+                    }
+                }
+            }
+            
+            if !download_successful {
+                failed_tracks.push(track_name.clone());
+                tracing::error!("Failed to download '{}' after {} attempts", track_name, max_attempts);
+            }
         }
 
-        tracing::info!(
-            "Done! Check your download folder to make sure you have all of these tracks: {:?}\n - ",
-            track_names.join("\n - ")
-        );
+        if failed_tracks.is_empty() {
+            tracing::info!(
+                "Done! All tracks downloaded successfully: {}\n - ",
+                track_names.join("\n - ")
+            );
+            // Clear progress file on successful completion
+            self.progress.clear()?;
+            tracing::info!("Progress file cleared");
+        } else {
+            tracing::warn!(
+                "Download completed with {} failures. Failed tracks:\n - {}",
+                failed_tracks.len(),
+                failed_tracks.join("\n - ")
+            );
+            tracing::info!("Progress saved. Run the command again to retry failed tracks.");
+            return Err(anyhow!("{} tracks failed to download", failed_tracks.len()));
+        }
 
+        Ok(())
+    }
+    
+    fn download_single_track(&self, tab: &Tab, solo_btn: &Element, download_button: &Element, track_name: &str, attempt: u32) -> Result<()> {
+        if attempt > 1 {
+            tracing::info!("Attempt {} for track '{}'", attempt, track_name);
+        }
+        
+        solo_btn.scroll_into_view()?;
+        sleep(Duration::from_secs(2));
+        solo_btn.click()?;
+        sleep(Duration::from_secs(2));
+
+        tracing::info!("- starting download...");
+        download_button.scroll_into_view()?;
+        sleep(Duration::from_secs(2));
+        download_button.click()?;
+        sleep(Duration::from_secs(2));
+
+        tracing::info!("- waiting for download modal...");
+        
+        // Increase timeout for retries
+        let timeout = Duration::from_secs(60 + (attempt as u64 - 1) * 30);
+        tab.wait_for_element_with_custom_timeout(".begin-download", timeout)
+            .map_err(|_| anyhow!("Timed out waiting for download modal after {:?}", timeout))?;
+
+        // Wait a bit for the modal to be fully rendered
+        sleep(Duration::from_secs(1));
+        
+        // Try to find and close the modal
+        match tab.find_element("button.js-modal-close") {
+            Ok(close_btn) => {
+                close_btn.click()?;
+            }
+            Err(_) => {
+                tracing::warn!("Could not find modal close button, proceeding anyway");
+            }
+        }
+        sleep(Duration::from_secs(4));
+        
         Ok(())
     }
 

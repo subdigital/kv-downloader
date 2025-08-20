@@ -1,3 +1,4 @@
+use crate::download_progress::DownloadProgress;
 use headless_chrome::{Browser, LaunchOptions, Tab};
 use std::error::Error;
 
@@ -20,6 +21,7 @@ impl Default for Config {
 pub struct Driver {
     pub config: Config,
     pub browser: Browser,
+    pub progress: DownloadProgress,
 }
 
 impl Driver {
@@ -38,7 +40,11 @@ impl Driver {
                 .expect("failed to set download path");
         }
 
-        Driver { config, browser }
+        Driver { 
+            config, 
+            browser,
+            progress: DownloadProgress::new(),
+        }
     }
 
     fn set_download_path(browser: &Browser, download_path: &str) -> Result<(), Box<dyn Error>> {

@@ -3,6 +3,7 @@ use clap::{command, Parser, Subcommand};
 use dotenv::dotenv;
 
 mod commands;
+mod download_progress;
 mod driver;
 mod keystore;
 mod prompt;
