@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4
+
+- Add a metadata file to track progress of downloads, allow a second run to continue where you left off
+- Add retry logic for individual tracks with increasing backoff logic
+- Add `--force` flag to ignore the progress and start over
+
 ## 0.3.3
 
 - Increased timeouts
