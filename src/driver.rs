@@ -40,10 +40,12 @@ impl Driver {
                 .expect("failed to set download path");
         }
 
-        Driver { 
-            config, 
+        let download_path = config.download_path.clone();
+
+        Driver {
+            config,
             browser,
-            progress: DownloadProgress::new(),
+            progress: DownloadProgress::new_with_path(download_path.as_deref()),
         }
     }
 

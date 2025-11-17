@@ -20,6 +20,16 @@ impl DownloadProgress {
         }
     }
 
+    pub fn new_with_path(download_path: Option<&str>) -> Self {
+        let progress_file = if let Some(path) = download_path {
+            PathBuf::from(path).join(".kv_download_progress.json")
+        } else {
+            PathBuf::from(".kv_download_progress.json")
+        };
+
+        Self { progress_file }
+    }
+
     pub fn is_track_downloaded(&self, track_name: &str) -> Result<bool> {
         if !self.progress_file.exists() {
             return Ok(false);
