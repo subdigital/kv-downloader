@@ -13,7 +13,7 @@ impl Driver {
             .wait_until_navigated()?;
 
         // this doesn't seem to work yet...
-        if let Some(cookie) = Keystore::get_auth_cookie().ok() {
+        if let Ok(cookie) = Keystore::get_auth_cookie() {
             tracing::debug!("Cookies before:");
             for c in tab.get_cookies()? {
                 tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");

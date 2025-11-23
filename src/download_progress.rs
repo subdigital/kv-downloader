@@ -102,7 +102,14 @@ impl DownloadProgress {
 
     fn save(&self, progress: &ProgressData) -> Result<()> {
         let content = serde_json::to_string_pretty(&progress)?;
-        fs::write(&self.progress_file, content)?;
+        match fs::write(&self.progress_file, content) {
+            Ok(_) => {
+                tracing::debug!("Wrote to progress file.")
+            }
+            Err(e) => {
+                tracing::error!("Error writing to progress file: {}", e);
+            }
+        }
         Ok(())
     }
 }

@@ -11,9 +11,11 @@
     },
     "program": "$ZED_WORKTREE_ROOT/target/debug/kv_downloader",
     "args": [
-      "download"
-      // "https://www.karaoke-version.com/custombackingtrack/simple-minds/don-t-you-forget-about-me.html",
-      // "-d $ZED_WORKTREE_ROOT"
+      "--debug",
+      "download",
+      "https://www.karaoke-version.com/custombackingtrack/simple-minds/don-t-you-forget-about-me.html",
+      "-d",
+      "$ZED_WORKTREE_ROOT"
       // "--headless"
     ],
     "request": "launch",

@@ -35,11 +35,8 @@ pub struct DownloadArgs {
 
     #[arg(short, long, help = "Whether to count in an intro for all tracks")]
     count_in: bool,
-    
-    #[arg(
-        long,
-        help = "Force restart, ignoring any previous download progress"
-    )]
+
+    #[arg(long, help = "Force restart, ignoring any previous download progress")]
     force_restart: bool,
 }
 
@@ -66,7 +63,7 @@ impl Download {
             download_path: args.download_path,
         };
         let driver = driver::Driver::new(config);
-        
+
         // Handle resume/restart logic
         if args.force_restart {
             tracing::info!("Force restart requested, clearing previous progress");
@@ -74,17 +71,20 @@ impl Download {
         } else if driver.progress.is_same_url(&args.song_url)? {
             let completed = driver.progress.get_completed_tracks()?;
             if !completed.is_empty() {
-                tracing::info!("Resuming previous download. Already completed {} tracks:", completed.len());
+                tracing::info!(
+                    "Resuming previous download. Already completed {} tracks:",
+                    completed.len()
+                );
                 for track in &completed {
                     tracing::info!("  ✓ {}", track);
                 }
             }
-        } else if driver.progress.get_completed_tracks()?.len() > 0 {
+        } else if !driver.progress.get_completed_tracks()?.is_empty() {
             // Different URL, clear the old progress
             tracing::info!("Different song detected, clearing previous progress");
             driver.progress.clear()?;
         }
-        
+
         driver.sign_in(&credentials.user, &credentials.password)?;
 
         let download_options = tasks::download_song::DownloadOptions {

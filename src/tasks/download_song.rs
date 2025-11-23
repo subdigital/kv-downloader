@@ -11,6 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::{error::Error, thread::sleep, time::Duration};
 
+/// Maximum time to wait for a download to complete (in seconds)
+const DOWNLOAD_COMPLETION_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
 #[derive(Default)]
 pub struct DownloadOptions {
     pub count_in: bool,
@@ -107,15 +110,21 @@ impl Driver {
             let mut attempts = 0;
             let max_attempts = 3;
             let mut download_successful = false;
-            
+
             while attempts < max_attempts && !download_successful {
                 attempts += 1;
-                
-                match self.download_single_track(tab, solo_btn, &download_button, &track_name, attempts) {
+
+                match self.download_single_track(
+                    tab,
+                    solo_btn,
+                    &download_button,
+                    &track_name,
+                    attempts,
+                ) {
                     Ok(_) => {
                         download_successful = true;
-                        self.progress.mark_track_downloaded(&track_name)?;
                         tracing::info!("- '{}' complete!", track_name);
+                        self.progress.mark_track_downloaded(&track_name)?;
                     }
                     Err(e) => {
                         tracing::warn!("Attempt {} failed for '{}': {}", attempts, track_name, e);
@@ -127,10 +136,14 @@ impl Driver {
                     }
                 }
             }
-            
+
             if !download_successful {
                 failed_tracks.push(track_name.clone());
-                tracing::error!("Failed to download '{}' after {} attempts", track_name, max_attempts);
+                tracing::error!(
+                    "Failed to download '{}' after {} attempts",
+                    track_name,
+                    max_attempts
+                );
             }
         }
 
@@ -154,25 +167,32 @@ impl Driver {
 
         Ok(())
     }
-    
-    fn download_single_track(&self, tab: &Tab, solo_btn: &Element, download_button: &Element, track_name: &str, attempt: u32) -> Result<()> {
+
+    fn download_single_track(
+        &self,
+        tab: &Tab,
+        solo_btn: &Element,
+        download_button: &Element,
+        track_name: &str,
+        attempt: u32,
+    ) -> Result<()> {
         if attempt > 1 {
             tracing::info!("Attempt {} for track '{}'", attempt, track_name);
         }
-        
+
         solo_btn.scroll_into_view()?;
-        sleep(Duration::from_secs(2));
+        sleep(Duration::from_millis(500));
         solo_btn.click()?;
-        sleep(Duration::from_secs(2));
+        sleep(Duration::from_millis(500));
 
         tracing::info!("- starting download...");
         download_button.scroll_into_view()?;
-        sleep(Duration::from_secs(2));
+        sleep(Duration::from_millis(500));
         download_button.click()?;
-        sleep(Duration::from_secs(2));
+        sleep(Duration::from_millis(500));
 
         tracing::info!("- waiting for download modal...");
-        
+
         // Increase timeout for retries
         let timeout = Duration::from_secs(60 + (attempt as u64 - 1) * 30);
         tab.wait_for_element_with_custom_timeout(".begin-download", timeout)
@@ -180,7 +200,11 @@ impl Driver {
 
         // Wait a bit for the modal to be fully rendered
         sleep(Duration::from_secs(1));
-        
+
+        // Extract the filename from the download link before closing the modal
+        let filename = self.extract_download_filename(tab)?;
+        tracing::debug!("Expected download filename: {}", filename);
+
         // Try to find and close the modal
         match tab.find_element("button.js-modal-close") {
             Ok(close_btn) => {
@@ -191,8 +215,108 @@ impl Driver {
             }
         }
         sleep(Duration::from_secs(4));
-        
+
+        // Wait for the download to complete
+        self.wait_for_download_completion(&filename)?;
+
         Ok(())
+    }
+
+    fn extract_download_filename(&self, tab: &Tab) -> Result<String> {
+        // Try to find the download link in the modal
+        let download_link = tab.find_element("div.begin-download a")?;
+
+        // Get the href attribute which should contain the filename
+        let href = download_link
+            .get_attribute_value("href")?
+            .ok_or_else(|| anyhow!("Download link has no href attribute"))?;
+
+        // Extract filename from the URL
+        let filename = href
+            .split('/')
+            .last()
+            .ok_or_else(|| anyhow!("Could not extract filename from URL"))?
+            .to_string();
+
+        // Decode URL-encoded characters
+        let decoded = urlencoding::decode(&filename)
+            .map_err(|e| anyhow!("Failed to decode filename: {}", e))?
+            .to_string();
+
+        Ok(decoded)
+    }
+
+    fn wait_for_download_completion(&self, expected_filename: &str) -> Result<()> {
+        let download_path = match &self.config.download_path {
+            Some(path) => PathBuf::from(path),
+            None => Self::get_default_download_dir()?,
+        };
+
+        tracing::info!("- waiting for download to complete...");
+        tracing::debug!("Monitoring directory: {}", download_path.display());
+
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS);
+
+        // The .crdownload file will have the same name as the final file with .crdownload appended
+        let crdownload_filename = format!("{}.crdownload", expected_filename);
+
+        // Poll for the specific .crdownload file
+        loop {
+            if start.elapsed() > timeout {
+                return Err(anyhow!("Download did not complete within {:?}", timeout));
+            }
+
+            // Check if the specific .crdownload file exists
+            match std::fs::read_dir(&download_path) {
+                Ok(entries) => {
+                    let has_crdownload = entries
+                        .filter_map(|e| e.ok())
+                        .any(|entry| entry.file_name().to_string_lossy() == crdownload_filename);
+
+                    if !has_crdownload {
+                        // Verify the final file actually exists
+                        let final_path = download_path.join(expected_filename);
+                        if final_path.exists() {
+                            tracing::info!("- download complete");
+                            return Ok(());
+                        }
+                        // If .crdownload is gone but final file doesn't exist yet, keep waiting
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Could not read download directory: {}", e);
+                    return Err(anyhow!("Failed to read download directory: {}", e));
+                }
+            }
+
+            // Wait a bit before checking again
+            sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn get_default_download_dir() -> Result<PathBuf> {
+        // Get the user's home directory
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not determine home directory"))?;
+
+        // Default download directory varies by OS
+        #[cfg(target_os = "macos")]
+        let download_dir = home.join("Downloads");
+
+        #[cfg(target_os = "linux")]
+        let download_dir = home.join("Downloads");
+
+        #[cfg(target_os = "windows")]
+        let download_dir = home.join("Downloads");
+
+        if !download_dir.exists() {
+            return Err(anyhow!(
+                "Default download directory does not exist: {}",
+                download_dir.display()
+            ));
+        }
+
+        Ok(download_dir)
     }
 
     pub fn extract_track_names(tab: &Tab) -> Result<Vec<String>> {
