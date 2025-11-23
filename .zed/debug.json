@@ -1,0 +1,52 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+[
+  {
+    "label": "Build & Debug",
+    "build": {
+      "command": "cargo",
+      "args": ["build"]
+    },
+    "program": "$ZED_WORKTREE_ROOT/target/debug/kv_downloader",
+    "args": [
+      "download"
+      // "https://www.karaoke-version.com/custombackingtrack/simple-minds/don-t-you-forget-about-me.html",
+      // "-d $ZED_WORKTREE_ROOT"
+      // "--headless"
+    ],
+    "request": "launch",
+    "adapter": "CodeLLDB",
+    "sourceLanguages": ["rust"]
+  },
+  {
+    "adapter": "CodeLLDB",
+    "label": "cargo test -p kv_downloader --all-targets",
+    "build": {
+      "label": "cargo test -p kv_downloader --all-targets",
+      "command": "cargo",
+      "args": [
+        "test",
+        "--package",
+        "kv_downloader",
+        "--all-targets",
+        "--no-run"
+      ],
+      "env": {
+        "RUSTC_TOOLCHAIN": "/Users/ben/.rustup/toolchains/1.90.0-aarch64-apple-darwin"
+      },
+      "cwd": "/Users/ben/projects/kv-downloader",
+      "use_new_terminal": false,
+      "allow_concurrent_runs": false,
+      "reveal": "always",
+      "reveal_target": "dock",
+      "hide": "never",
+      "tags": [],
+      "shell": "system",
+      "show_summary": false,
+      "show_command": false
+    },
+    "sourceLanguages": ["rust"]
+  }
+]

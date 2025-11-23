@@ -1,8 +1,14 @@
 use crate::driver::Driver;
 
 use anyhow::{anyhow, Result};
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+use headless_chrome::protocol::cdp::types::Event;
+use headless_chrome::protocol::cdp::Page::StartScreencastFormatOption;
 use headless_chrome::{Element, Tab};
 use std::fmt::Display;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::{error::Error, thread::sleep, time::Duration};
 
 #[derive(Default)]
@@ -15,6 +21,7 @@ pub struct DownloadOptions {
 pub enum DownloadError {
     NotPurchased,
     NotASongPage,
+    HumanVerificationRequired,
 }
 
 impl Display for DownloadError {
@@ -22,6 +29,7 @@ impl Display for DownloadError {
         match self {
             Self::NotPurchased => f.write_str("This track has not been purchased"),
             Self::NotASongPage => f.write_str("This doesn't look like a song page. Check the url."),
+            Self::HumanVerificationRequired => f.write_str("The headless browser was detected as a bot and is being presented with a 'Verify you are human' step. Try running without --headless.")
         }
     }
 }
@@ -31,34 +39,20 @@ impl Driver {
     pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<()> {
         // Set the URL in progress tracking
         self.progress.set_url(url)?;
-        
+
         let tab = self.browser.new_tab()?;
         tab.set_default_timeout(Duration::from_secs(30));
-
-        // tab.add_event_listener(Arc::new(move |event: &Event| match event {
-        //     Event::PageScreencastFrame(frame_event) => {
-        //         let bytes = BASE64_STANDARD
-        //             .decode(frame_event.params.data.clone())
-        //             .unwrap();
-        //         let ts = frame_event.params.metadata.timestamp.unwrap();
-        //         std::fs::write(format!("screencast-{}.jpg", ts), &bytes).unwrap();
-        //     }
-        //     _ => {}
-        // }))?;
-
-        // tab.start_screencast(
-        //     Some(StartScreencastFormatOption::Jpeg),
-        //     Some(80),
-        //     Some(1280),
-        //     Some(720),
-        //     Some(4),
-        // )?;
 
         tab.navigate_to(url)?.wait_until_navigated()?;
 
         if !self.is_a_song_page(&tab) {
             tab.stop_screencast()?;
-            return Err(anyhow!(DownloadError::NotASongPage));
+
+            if self.is_verify_you_are_human_page(&tab) {
+                return Err(anyhow!(DownloadError::HumanVerificationRequired));
+            } else {
+                return Err(anyhow!(DownloadError::NotASongPage));
+            }
         }
 
         if !self.is_downloadable(&tab) {
@@ -67,7 +61,8 @@ impl Driver {
         }
 
         if options.count_in {
-            let el = tab.wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(15))?;
+            let el = tab
+                .wait_for_element_with_custom_timeout("input#precount", Duration::from_secs(15))?;
             if !el.is_checked() {
                 el.click()?;
             }
@@ -90,20 +85,24 @@ impl Driver {
 
         tab.enable_debugger()?;
         sleep(Duration::from_secs(2));
-        
+
         let mut failed_tracks = Vec::new();
-        
+
         for (index, solo_btn) in solo_buttons.iter().enumerate() {
             let track_name = track_names[index].clone();
-            
+
             // Check if track was already downloaded
             if self.progress.is_track_downloaded(&track_name)? {
-                tracing::info!("Skipping track {} '{}' (already downloaded)", index + 1, track_name);
+                tracing::info!(
+                    "Skipping track {} '{}' (already downloaded)",
+                    index + 1,
+                    track_name
+                );
                 continue;
             }
-            
+
             tracing::info!("Processing track {} '{}'", index + 1, track_name);
-            
+
             // Try downloading with retries
             let mut attempts = 0;
             let max_attempts = 3;
@@ -225,7 +224,15 @@ impl Driver {
     fn is_a_song_page(&self, tab: &Tab) -> bool {
         let has_mixer = tab.find_element("div.mixer").is_ok();
         let has_download_button = tab.find_element("a.download").is_ok();
+
         has_mixer && has_download_button
+    }
+
+    fn is_verify_you_are_human_page(&self, tab: &Tab) -> bool {
+        tab.get_title()
+            .ok()
+            .unwrap_or_default()
+            .contains("Suspicious activity has been detected")
     }
 
     fn is_downloadable(&self, tab: &Tab) -> bool {
@@ -294,6 +301,40 @@ impl Driver {
             .click()?;
 
         sleep(Duration::from_secs(4));
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn print_source_html(&self, tab: &Tab) {
+        let source_obj = tab
+            .evaluate("document.documentElement.outerHTML", true)
+            .ok()
+            .unwrap();
+        let source_html = source_obj.value.unwrap().as_str().unwrap().to_string();
+        println!("{}", source_html);
+    }
+
+    #[allow(dead_code)]
+    fn record_screencast(&self, tab: &Tab) -> Result<()> {
+        tab.add_event_listener(Arc::new(|event: &Event| match event {
+            Event::PageScreencastFrame(frame_event) => {
+                let bytes = BASE64_STANDARD
+                    .decode(frame_event.params.data.clone())
+                    .unwrap();
+                let ts = frame_event.params.metadata.timestamp.unwrap();
+                std::fs::write(format!("screencast-{}.jpg", ts), &bytes).unwrap();
+            }
+            _ => {}
+        }))?;
+
+        tab.start_screencast(
+            Some(StartScreencastFormatOption::Jpeg),
+            Some(80),
+            Some(1280),
+            Some(720),
+            Some(4),
+        )?;
 
         Ok(())
     }
