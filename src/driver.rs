@@ -1,11 +1,15 @@
 use crate::download_progress::DownloadProgress;
-use headless_chrome::{Browser, LaunchOptions, Tab};
+use headless_chrome::{types::Bounds, Browser, LaunchOptions, Tab};
 use std::error::Error;
+use std::time::Duration;
+
+const DEFAULT_BROWSER_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub struct Config {
     pub domain: String,
     pub headless: bool,
     pub download_path: Option<String>,
+    pub idle_browser_timeout: Duration,
 }
 
 impl Default for Config {
@@ -14,6 +18,7 @@ impl Default for Config {
             domain: "www.karaoke-version.com".to_string(),
             headless: false,
             download_path: None,
+            idle_browser_timeout: DEFAULT_BROWSER_IDLE_TIMEOUT,
         }
     }
 }
@@ -30,6 +35,8 @@ impl Driver {
             headless: config.headless,
             window_size: Some((1440, 1200)),
             enable_logging: true,
+            // Keep the DevTools websocket alive during long downloads.
+            idle_browser_timeout: config.idle_browser_timeout,
             ..Default::default()
         })
         .expect("Unable to create headless chromium browser");
@@ -64,6 +71,16 @@ impl Driver {
         tab.call_method(download_behavior_method)?;
 
         Ok(())
+    }
+
+    pub fn minimize_tab(&self, tab: &Tab) {
+        if self.config.headless {
+            return;
+        }
+
+        if let Err(err) = tab.set_bounds(Bounds::Minimized) {
+            tracing::debug!("Failed to minimize browser window: {}", err);
+        }
     }
 
     pub fn type_fast(&self, tab: &Tab, text: &str) {

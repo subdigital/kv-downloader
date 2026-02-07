@@ -11,17 +11,17 @@ use clap::{arg, command, Args};
 #[derive(Debug, Args)]
 #[command(flatten_help = true)]
 pub struct DownloadArgs {
-    song_url: String,
+    pub song_url: String,
 
     #[arg(
         short = 'H',
         long,
         help = "Set this flag to launch the browser headless."
     )]
-    headless: bool,
+    pub headless: bool,
 
     #[arg(short, long)]
-    download_path: Option<String>,
+    pub download_path: Option<String>,
 
     #[arg(
         short,
@@ -31,13 +31,20 @@ pub struct DownloadArgs {
         default_value = "0",
         allow_hyphen_values = true,
     )]
-    transpose: Option<i8>,
+    pub transpose: Option<i8>,
 
     #[arg(short, long, help = "Whether to count in an intro for all tracks")]
-    count_in: bool,
+    pub count_in: bool,
 
     #[arg(long, help = "Force restart, ignoring any previous download progress")]
-    force_restart: bool,
+    pub force_restart: bool,
+
+    #[arg(
+        long,
+        help = "How long Chrome can be idle without events before the connection is closed (seconds)",
+        default_value = "300"
+    )]
+    pub browser_idle_timeout_secs: u64,
 }
 
 pub struct Download {}
@@ -61,6 +68,7 @@ impl Download {
             domain: extract_domain_from_url(&args.song_url).expect("missing domain from url"),
             headless: args.headless,
             download_path: args.download_path,
+            idle_browser_timeout: Duration::from_secs(args.browser_idle_timeout_secs),
         };
         let driver = driver::Driver::new(config);
 
@@ -90,6 +98,7 @@ impl Download {
         let download_options = tasks::download_song::DownloadOptions {
             count_in: args.count_in,
             transpose: args.transpose.unwrap_or(0),
+            selected_tracks: None,
         };
         driver.download_song(&args.song_url, download_options)?;
 

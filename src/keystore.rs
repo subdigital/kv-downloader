@@ -33,6 +33,13 @@ impl Keystore {
         Ok(())
     }
 
+    pub fn clear_auth_cookie() -> Result<()> {
+        if let Ok(entry) = Entry::new(KEYSTORE_SERVICE, KV_SESSION_COOKIE_KEY) {
+            let _ = entry.delete_credential().ok();
+        }
+        Ok(())
+    }
+
     pub fn get_credentials() -> Result<Credentials> {
         let entry = Entry::new(KEYSTORE_SERVICE, KV_CREDENTIALS_KEY)?;
         let encoded_data = entry.get_secret()?;
@@ -63,6 +70,12 @@ impl Keystore {
         };
 
         Ok(cookie_param)
+    }
+
+    pub fn get_auth_cookie_value() -> Result<String> {
+        let secret = Entry::new(KEYSTORE_SERVICE, KV_SESSION_COOKIE_KEY)?.get_secret()?;
+        let cookie: Cookie = serde_json::from_slice(&secret).expect("Unable to deserialize cookie");
+        Ok(cookie.value)
     }
 
     pub fn set_auth_cookie(cookie: &Cookie) -> Result<()> {

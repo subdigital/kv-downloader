@@ -18,6 +18,7 @@ const DOWNLOAD_COMPLETION_TIMEOUT_SECS: u64 = 300; // 5 minutes
 pub struct DownloadOptions {
     pub count_in: bool,
     pub transpose: i8,
+    pub selected_tracks: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -44,6 +45,7 @@ impl Driver {
         self.progress.set_url(url)?;
 
         let tab = self.browser.new_tab()?;
+        self.minimize_tab(&tab);
         tab.set_default_timeout(Duration::from_secs(30));
 
         tab.navigate_to(url)?.wait_until_navigated()?;
@@ -73,18 +75,31 @@ impl Driver {
 
         self.adjust_pitch(options.transpose, &tab)?;
 
-        self.solo_and_download_tracks(&tab)?;
+        self.solo_and_download_tracks(&tab, options.selected_tracks.as_deref())?;
 
         tab.stop_screencast()?;
 
         Ok(())
     }
 
-    fn solo_and_download_tracks(&self, tab: &Tab) -> Result<()> {
+    fn solo_and_download_tracks(
+        &self,
+        tab: &Tab,
+        selected_tracks: Option<&[String]>,
+    ) -> Result<()> {
         let solo_button_sel = ".track__controls.track__solo";
         let solo_buttons = tab.find_elements(solo_button_sel)?;
         let download_button = tab.find_element("a.download")?;
-        let track_names = Driver::extract_track_names(tab)?;
+        let track_names = Driver::extract_track_names(tab)?
+            .into_iter()
+            .map(|name| normalize_track_name(&name))
+            .collect::<Vec<_>>();
+        let selected = selected_tracks.map(|tracks| {
+            tracks
+                .iter()
+                .map(|t| normalize_track_name(t))
+                .collect::<std::collections::HashSet<String>>()
+        });
 
         tab.enable_debugger()?;
         sleep(Duration::from_secs(2));
@@ -93,6 +108,13 @@ impl Driver {
 
         for (index, solo_btn) in solo_buttons.iter().enumerate() {
             let track_name = track_names[index].clone();
+
+            if let Some(selected) = &selected {
+                if !selected.contains(&track_name) {
+                    tracing::debug!("Skipping track '{}' (not selected)", track_name);
+                    continue;
+                }
+            }
 
             // Check if track was already downloaded
             if self.progress.is_track_downloaded(&track_name)? {
@@ -462,6 +484,15 @@ impl Driver {
 
         Ok(())
     }
+}
+
+fn normalize_track_name(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
 }
 
 trait Checkable {

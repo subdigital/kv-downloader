@@ -7,6 +7,7 @@ use anyhow::Result;
 impl Driver {
     pub fn sign_in(&self, user: &str, pass: &str) -> Result<()> {
         let tab = self.browser.new_tab()?;
+        self.minimize_tab(&tab);
 
         // navigate to the homepage
         tab.navigate_to(&format!("https://{}", self.config.domain))?

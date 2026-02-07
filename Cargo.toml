@@ -3,6 +3,9 @@ name = "kv_downloader"
 version = "0.4.0"
 edition = "2021"
 
+[workspace]
+members = ["tui"]
+
 [dependencies]
 clap = { version = "4.5.13", features = ["derive"] }
 dotenv = "0.15.0"
@@ -22,6 +25,9 @@ rpassword = "7.3.1"
 base64 = "0.22.1"
 dirs = "5.0"
 urlencoding = "2.1"
+gpui = "0.2.2"
+gpui-component = "0.5.0"
+gpui-component-assets = "0.5.0"
 
 [dev-dependencies]
 tiny_http = "0.12.0"
