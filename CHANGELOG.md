@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Adds a way to pass additional flags to the headless chrome binary. Separate these arguments from kv_downloader args with a single `--`.
+
 ## 0.4.0
 
 - Add a metadata file to track progress of downloads, allow a second run to continue where you left off
