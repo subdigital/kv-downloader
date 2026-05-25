@@ -1,11 +1,12 @@
 use crate::download_progress::DownloadProgress;
 use headless_chrome::{Browser, LaunchOptions, Tab};
-use std::error::Error;
+use std::{error::Error, ffi::OsStr};
 
 pub struct Config {
     pub domain: String,
     pub headless: bool,
     pub download_path: Option<String>,
+    pub headless_chrome_args: Vec<String>,
 }
 
 impl Default for Config {
@@ -14,6 +15,7 @@ impl Default for Config {
             domain: "www.karaoke-version.com".to_string(),
             headless: false,
             download_path: None,
+            headless_chrome_args: Vec::new(),
         }
     }
 }
@@ -26,10 +28,13 @@ pub struct Driver {
 
 impl Driver {
     pub fn new(config: Config) -> Self {
+        let args: Vec<&OsStr> = dbg!(config.headless_chrome_args.iter().map(OsStr::new).collect());
+
         let browser = Browser::new(LaunchOptions {
             headless: config.headless,
             window_size: Some((1440, 1200)),
             enable_logging: true,
+            args,
             ..Default::default()
         })
         .expect("Unable to create headless chromium browser");

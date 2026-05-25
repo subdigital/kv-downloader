@@ -38,6 +38,9 @@ pub struct DownloadArgs {
 
     #[arg(long, help = "Force restart, ignoring any previous download progress")]
     force_restart: bool,
+
+    #[arg(last = true, allow_hyphen_values = true)]
+    browser_args: Vec<String>,
 }
 
 pub struct Download {}
@@ -61,6 +64,7 @@ impl Download {
             domain: extract_domain_from_url(&args.song_url).expect("missing domain from url"),
             headless: args.headless,
             download_path: args.download_path,
+            headless_chrome_args: args.browser_args,
         };
         let driver = driver::Driver::new(config);
 
