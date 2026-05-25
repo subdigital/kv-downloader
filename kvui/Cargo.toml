@@ -1,7 +1,11 @@
 [package]
-name = "tui"
+name = "kvui"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "kvui"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -13,4 +17,4 @@ url = "2.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 dirs = "5.0"
-kv_downloader = { path = ".." }
+kv_core = { path = "../core" }

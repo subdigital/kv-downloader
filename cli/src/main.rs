@@ -2,13 +2,6 @@ use anyhow::Result;
 use clap::{command, Parser, Subcommand};
 use dotenv::dotenv;
 
-mod commands;
-mod download_progress;
-mod driver;
-mod keystore;
-mod prompt;
-mod tasks;
-
 #[derive(Debug, Parser)]
 #[command(name = "kv-downloader")]
 #[command(version, about, long_about)]
@@ -25,7 +18,7 @@ enum Commands {
     Auth,
     Logout,
     #[command(arg_required_else_help = true)]
-    Download(commands::DownloadArgs),
+    Download(kv_core::commands::DownloadArgs),
 }
 
 fn main() -> Result<()> {
@@ -39,9 +32,9 @@ fn main() -> Result<()> {
         })
         .init();
     match cli.command {
-        Commands::Auth => commands::auth::run()?,
-        Commands::Logout => commands::logout::run()?,
-        Commands::Download(args) => commands::Download::run(args)?,
+        Commands::Auth => kv_core::commands::auth::run()?,
+        Commands::Logout => kv_core::commands::logout::run()?,
+        Commands::Download(args) => kv_core::commands::Download::run(args)?,
     }
 
     Ok(())

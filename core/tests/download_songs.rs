@@ -4,7 +4,7 @@ use std::error::Error;
 
 use server::Server;
 
-use kv_downloader::driver::{Config, Driver};
+use kv_core::driver::{Config, Driver};
 
 #[test]
 fn extracts_track_names() -> Result<(), Box<dyn Error>> {

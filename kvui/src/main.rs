@@ -4,7 +4,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{execute, terminal};
-use kv_downloader::{driver, keystore, tasks};
+use kv_core::{driver, keystore, tasks};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -871,8 +871,8 @@ fn render_download_block(
 }
 
 fn login_flow() -> Result<()> {
-    let user = kv_downloader::prompt::prompt("Username: ", false)?;
-    let pass = kv_downloader::prompt::prompt("Password: ", true)?;
+    let user = kv_core::prompt::prompt("Username: ", false)?;
+    let pass = kv_core::prompt::prompt("Password: ", true)?;
 
     keystore::Keystore::login(&user, &pass)?;
 
@@ -894,36 +894,8 @@ fn start_download(
     transpose: i8,
     selected_tracks: Vec<String>,
 ) -> Result<()> {
-    let credentials = keystore::Keystore::get_credentials()
-        .map_err(|_| anyhow!("Must login first"))?;
-
-    let config = driver::Config {
-        domain: extract_domain_from_url(song_url)
-            .ok_or_else(|| anyhow!("Missing domain from url"))?,
-        headless: false,
-        download_path: None,
-        idle_browser_timeout: Duration::from_secs(300),
-    };
-    let driver = driver::Driver::new(config);
-
-    if driver.progress.is_same_url(song_url)? {
-        let completed = driver.progress.get_completed_tracks()?;
-        if !completed.is_empty() {
-            tracing::info!(
-                "Resuming previous download. Already completed {} tracks:",
-                completed.len()
-            );
-            for track in &completed {
-                tracing::info!("  ✓ {}", track);
-            }
-        }
-    } else if !driver.progress.get_completed_tracks()?.is_empty() {
-        tracing::info!("Different song detected, clearing previous progress");
-        driver.progress.clear()?;
-    }
-
-    driver.sign_in(&credentials.user, &credentials.password)?;
-
+    let domain = extract_domain_from_url(song_url)
+        .ok_or_else(|| anyhow!("Missing domain from url"))?;
     let download_options = tasks::download_song::DownloadOptions {
         count_in,
         transpose,
@@ -933,8 +905,7 @@ fn start_download(
             Some(selected_tracks)
         },
     };
-    driver.download_song(song_url, download_options)?;
-
+    tasks::download_song::download_song_http(song_url, download_options, None, &domain)?;
     Ok(())
 }
 
@@ -1076,7 +1047,7 @@ fn update_download_state(app: &mut App) {
         return;
     };
 
-    let progress = kv_downloader::download_progress::DownloadProgress::new();
+    let progress = kv_core::download_progress::DownloadProgress::new();
     let completed = progress
         .get_completed_tracks()
         .unwrap_or_default()

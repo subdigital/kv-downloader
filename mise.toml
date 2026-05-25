@@ -1,28 +1,33 @@
 [env]
 _.file = ".env"
 
+[tasks.build-cli]
+description = "Build the CLI"
+run = "cargo build -p cli --release"
+
 [tasks.codesign-cli]
 description = "Codesign the release binary for macOS Keychain access"
-env = { APP_NAME = "kv-downloader" }
+depends = "build-cli"
+env = { APP_NAME = "kv_downloader" }
 run = [
   "codesign --force --options runtime --timestamp --sign \"$CODESIGN_IDENTITY\" \"./target/release/$APP_NAME\""
 ]
 
 [tasks.codesign-tui]
-description = "Codesign the tui for macOS Keychain access"
-env = { APP_NAME = "tui" }
-dir = "tui"
+description = "Codesign the kvui binary for macOS Keychain access"
+env = { APP_NAME = "kvui" }
+dir = "kvui"
 run = [
   "codesign --force --options runtime --timestamp --sign \"$CODESIGN_IDENTITY\" \"./../target/debug/$APP_NAME\""
 ]
 
 [tasks.build-tui]
 depends_post = "codesign-tui"
-description = "build with cargo and codesign"
-run = "cargo build -p tui"
+description = "build kvui with cargo and codesign"
+run = "cargo build -p kvui"
 
 [tasks.tui]
-description = "Build, codesign, and run the tui"
+description = "Build, codesign, and run kvui"
 depends = "build-tui"
 wait_for = "codesign-tui"
-run = 'script -q /dev/null -c "cargo run -p tui"'
+run = 'script -q /dev/null /bin/zsh -lc "cargo run -p kvui"'

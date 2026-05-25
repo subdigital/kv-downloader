@@ -9,10 +9,8 @@ repo and make your own changes. I _may_ accept pull requests if the changes are 
 
 ## What it does
 
-This app will drive a headless (or visible) Chromium browser that will log into your account, navigate to
-a song page. It will solo & download each individual track separately.
-
-The browser portion of this app will auto-download upon first use.
+This app downloads individual tracks via a direct HTTP workflow by default. A Chromium-based fallback
+is available when needed.
 
 ## Why?
 
@@ -22,7 +20,7 @@ I like to set up my own mix for backing tracks using Logic. For maximum flexibil
 
 - macOS, Linux, Windows
 - Karaoke Version account with purchased songs
-- Chromium (will be downloaded automatically)
+- Chromium (used for authentication and optional browser-based downloads)
 
 ## Installation & Set Up
 
@@ -43,16 +41,31 @@ First, you have to purchase the track in your Karaoke Version account. Copy the 
 
 Then run `kv_downloader download <song url>`. You can also pass options to customize the behavior:
 
+### TUI
+
+Run the terminal UI with:
+
+```
+kvui
+```
+
+From source:
+
+```
+cargo run -p kvui
+```
+
 ## Options
 
 - `-d <path>` - Change the download location
--  `-h` or `--headless` - Use headless mode, which hides the UI.
+-  `-h` or `--headless` - Use headless mode (only when `--browser` is used).
 -  `-t <transpose offset>` - Change the pitch of the downloaded tracks (-1 to go down half step, 1 to go up half step, etc)
 - `--count-in` - Include the intro precount on all tracks
 - `--debug` - Enable debug logging (in case something goes wrong this helps give more detail)
+- `--browser` - Use Chromium automation instead of the default HTTP downloader
 
 Using headless mode may make it less clear what is going on behind the scenes, so I suggest testing it out
-in the regular mode first.
+in the regular mode first (when using `--browser`).
 
 
 ## Build and Run from Source
@@ -69,7 +82,9 @@ KV_PASSWORD=<yourpassword>
 
 - type `cargo run -- --help` (note the double dashes to separate the args from the cargo command)
 
-Usage is the same as above, except you'll be typing `cargo run --` instead of `kv_downloader`.
+Usage is the same as above, except you'll be typing `cargo run -p cli --` instead of `kv_downloader`.
+
+To use the Chromium-based downloader instead of the default HTTP flow, pass `--browser`.
 
 For example:
 

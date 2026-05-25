@@ -20,6 +20,9 @@ pub struct DownloadArgs {
     )]
     pub headless: bool,
 
+    #[arg(long, help = "Use Chromium browser automation instead of HTTP download")]
+    pub browser: bool,
+
     #[arg(short, long)]
     pub download_path: Option<String>,
 
@@ -63,6 +66,23 @@ impl Download {
         );
 
         tracing::debug!(args = format!("cli args: {:?}", args));
+
+        if !args.browser {
+            let download_options = tasks::download_song::DownloadOptions {
+                count_in: args.count_in,
+                transpose: args.transpose.unwrap_or(0),
+                selected_tracks: None,
+            };
+            let domain =
+                extract_domain_from_url(&args.song_url).expect("missing domain from url");
+            tasks::download_song::download_song_http(
+                &args.song_url,
+                download_options,
+                args.download_path.clone(),
+                &domain,
+            )?;
+            return Ok(());
+        }
 
         let config = driver::Config {
             domain: extract_domain_from_url(&args.song_url).expect("missing domain from url"),
