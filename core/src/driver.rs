@@ -1,6 +1,8 @@
 use crate::download_progress::DownloadProgress;
+use headless_chrome::protocol::cdp::Network::CookieParam;
 use headless_chrome::{types::Bounds, Browser, LaunchOptions, Tab};
 use std::error::Error;
+use std::ffi::OsStr;
 use std::time::Duration;
 
 const DEFAULT_BROWSER_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -35,11 +37,19 @@ impl Driver {
             headless: config.headless,
             window_size: Some((1440, 1200)),
             enable_logging: true,
+            // Avoid Chromium's own macOS Keychain prompts for temporary profiles.
+            args: vec![
+                OsStr::new("--password-store=basic"),
+                OsStr::new("--use-mock-keychain"),
+            ],
             // Keep the DevTools websocket alive during long downloads.
             idle_browser_timeout: config.idle_browser_timeout,
             ..Default::default()
         })
-        .expect("Unable to create headless chromium browser");
+        .unwrap_or_else(|err| {
+            let mode = if config.headless { "headless" } else { "visible" };
+            panic!("Unable to create {mode} Chromium browser: {err}");
+        });
 
         if let Some(download_path) = &config.download_path {
             tracing::info!("Setting download path to: {}", download_path);
@@ -81,6 +91,26 @@ impl Driver {
         if let Err(err) = tab.set_bounds(Bounds::Minimized) {
             tracing::debug!("Failed to minimize browser window: {}", err);
         }
+    }
+
+    pub fn set_session_cookie(&self, tab: &Tab, value: &str) -> anyhow::Result<()> {
+        tab.set_cookies(vec![CookieParam {
+            name: "karaoke-version".to_string(),
+            value: value.to_string(),
+            url: Some(format!("https://{}", self.config.domain)),
+            domain: None,
+            secure: None,
+            http_only: None,
+            same_site: None,
+            path: None,
+            expires: None,
+            priority: None,
+            same_party: None,
+            source_scheme: None,
+            source_port: None,
+            partition_key: None,
+        }])?;
+        Ok(())
     }
 
     pub fn type_fast(&self, tab: &Tab, text: &str) {

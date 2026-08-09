@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use clap::{Parser, ValueEnum};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -12,18 +13,25 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use scraper::{Html, Selector};
+use std::fs::File;
 use std::io::{self, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::EnvFilter;
 use url::Url;
+
+mod catalog;
 
 #[derive(Clone, Debug)]
 struct Song {
     title: String,
     artist: String,
     url: String,
+    first_seen: i64,
+    purchase_date: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +56,37 @@ enum Screen {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SongsMode {
+    Browse,
+    ResetProgress,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SongSort {
+    DateDescending,
+    Artist,
+    Title,
+}
+
+impl SongSort {
+    fn next(self) -> Self {
+        match self {
+            Self::DateDescending => Self::Artist,
+            Self::Artist => Self::Title,
+            Self::Title => Self::DateDescending,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DateDescending => "Recently added",
+            Self::Artist => "Artist",
+            Self::Title => "Title",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailFocus {
     Tracks,
     Download,
@@ -58,7 +97,12 @@ struct App {
     menu_items: Vec<String>,
     menu_index: usize,
     songs: Vec<Song>,
+    all_songs: Vec<Song>,
     songs_state: ListState,
+    songs_mode: SongsMode,
+    song_sort: SongSort,
+    song_filter: String,
+    editing_song_filter: bool,
     tracks: Vec<Track>,
     tracks_state: ListState,
     detail_focus: DetailFocus,
@@ -70,6 +114,7 @@ struct App {
     download: Option<DownloadState>,
     logs: Arc<Mutex<LogBuffer>>,
     log_scroll: u16,
+    log_follow: bool,
     loading: Option<LoadingState>,
     spinner_index: usize,
     confirm: Option<ConfirmState>,
@@ -84,7 +129,12 @@ impl App {
             menu_items: Vec::new(),
             menu_index: 0,
             songs: Vec::new(),
+            all_songs: Vec::new(),
             songs_state: ListState::default(),
+            songs_mode: SongsMode::Browse,
+            song_sort: SongSort::DateDescending,
+            song_filter: String::new(),
+            editing_song_filter: false,
             tracks: Vec::new(),
             tracks_state: ListState::default(),
             detail_focus: DetailFocus::Tracks,
@@ -96,6 +146,7 @@ impl App {
             download: None,
             logs,
             log_scroll: 0,
+            log_follow: true,
             loading: None,
             spinner_index: 0,
             confirm: None,
@@ -115,12 +166,18 @@ impl App {
         self.menu_items = if authenticated {
             vec![
                 "Browse My Songs".to_string(),
+                "Resync Songs List".to_string(),
+                "Reset Song Progress".to_string(),
+                "Reset All Download Progress".to_string(),
                 "Logout".to_string(),
                 "Quit".to_string(),
             ]
         } else {
             vec![
                 "Browse My Songs".to_string(),
+                "Resync Songs List".to_string(),
+                "Reset Song Progress".to_string(),
+                "Reset All Download Progress".to_string(),
                 "Login".to_string(),
                 "Quit".to_string(),
             ]
@@ -129,22 +186,218 @@ impl App {
     }
 }
 
-fn main() -> Result<()> {
-    run_tui()
+fn demo_songs() -> Vec<Song> {
+    vec![
+        Song {
+            title: "Don't You (Forget About Me)".to_string(),
+            artist: "Simple Minds".to_string(),
+            url: "https://example.com/simple-minds".to_string(),
+            first_seen: 5,
+            purchase_date: 20260206,
+        },
+        Song {
+            title: "What I Like About You".to_string(),
+            artist: "The Romantics".to_string(),
+            url: "https://example.com/the-romantics".to_string(),
+            first_seen: 4,
+            purchase_date: 20251117,
+        },
+        Song {
+            title: "Don't Look Back in Anger".to_string(),
+            artist: "Oasis".to_string(),
+            url: "https://example.com/oasis".to_string(),
+            first_seen: 3,
+            purchase_date: 20251127,
+        },
+        Song {
+            title: "Livin' on a Prayer".to_string(),
+            artist: "Bon Jovi".to_string(),
+            url: "https://example.com/bon-jovi".to_string(),
+            first_seen: 2,
+            purchase_date: 20250831,
+        },
+        Song {
+            title: "Use Somebody".to_string(),
+            artist: "Kings of Leon".to_string(),
+            url: "https://example.com/kings-of-leon".to_string(),
+            first_seen: 1,
+            purchase_date: 20250831,
+        },
+    ]
 }
 
-fn run_tui() -> Result<()> {
+fn demo_tracks() -> Vec<String> {
+    [
+        "Click",
+        "Drum Kit",
+        "Bass",
+        "Electric Guitar (clean)",
+        "Electric Guitar (crunch)",
+        "Piano",
+        "Synth Pad",
+        "Backing Vocals",
+        "Lead Vocal",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
+    app.menu_items = vec![
+        "Browse My Songs".to_string(),
+        "Resync Songs List".to_string(),
+        "Reset Song Progress".to_string(),
+        "Reset All Download Progress".to_string(),
+        "Logout".to_string(),
+        "Quit".to_string(),
+    ];
+    app.status = "Ready".to_string();
+
+    match screen {
+        DemoScreen::Menu => app.screen = Screen::Menu,
+        DemoScreen::Songs => {
+            app.all_songs = demo_songs();
+            apply_song_view(app);
+            app.screen = Screen::Songs;
+        }
+        DemoScreen::Song => {
+            let song = demo_songs().remove(0);
+            app.current_song = Some(song);
+            app.tracks = demo_tracks()
+                .into_iter()
+                .map(|name| Track {
+                    name,
+                    selected: true,
+                })
+                .collect();
+            app.tracks_state.select(Some(1));
+            app.base_key = Some("E".to_string());
+            app.intro_click = true;
+            app.detail_focus = DetailFocus::Tracks;
+            app.screen = Screen::SongDetail;
+        }
+        DemoScreen::Download | DemoScreen::Complete => {
+            let song = demo_songs().remove(0);
+            let statuses = [
+                TrackStatus::Done,
+                TrackStatus::Done,
+                TrackStatus::Done,
+                TrackStatus::Done,
+                TrackStatus::Done,
+                TrackStatus::Downloading,
+                TrackStatus::Pending,
+                TrackStatus::Failed,
+                TrackStatus::Pending,
+            ];
+            let tracks = demo_tracks()
+                .into_iter()
+                .zip(statuses)
+                .map(|(name, status)| TrackStatusItem {
+                    name,
+                    attempt: if status == TrackStatus::Downloading { 2 } else { 0 },
+                    status,
+                })
+                .collect();
+            let complete = matches!(screen, DemoScreen::Complete);
+            app.download = Some(DownloadState {
+                song,
+                count_in: true,
+                transpose: 0,
+                tracks,
+                handle: None,
+                done: complete.then_some(Err(
+                    "1 track failed after retries; completed tracks were saved.".to_string(),
+                )),
+                started_at: Instant::now(),
+                duration: complete.then_some(Duration::from_secs(154)),
+                download_dir: dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("~"))
+                    .join("Downloads"),
+            });
+            if complete {
+                if let Some(download) = app.download.as_mut() {
+                    for track in &mut download.tracks {
+                        if track.status == TrackStatus::Downloading
+                            || track.status == TrackStatus::Pending
+                        {
+                            track.status = TrackStatus::Done;
+                        }
+                    }
+                }
+                app.screen = Screen::DownloadDone;
+            } else {
+                if let Ok(mut logs) = app.logs.lock() {
+                    logs.push_line("INFO  Processing track 7 'Piano'".to_string());
+                    logs.push_line("INFO  Attempt 2/3 for 'Piano'".to_string());
+                    logs.push_line("INFO  Waiting for 'Piano' to be prepared".to_string());
+                }
+                app.screen = Screen::DownloadStatus;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "kvui", version, about = "KV Downloader terminal UI")]
+struct Cli {
+    #[arg(
+        long,
+        value_enum,
+        hide = true,
+        help = "Render a deterministic screen for documentation screenshots"
+    )]
+    demo_screen: Option<DemoScreen>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 0..=1,
+        default_missing_value = "kvui-diagnostics.log",
+        help = "Write detailed diagnostics to a log file"
+    )]
+    diagnostics: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DemoScreen {
+    Menu,
+    Songs,
+    Song,
+    Download,
+    Complete,
+}
+
+fn main() -> Result<()> {
+    dotenv::dotenv().ok();
+    let cli = Cli::parse();
+    run_tui(cli.diagnostics, cli.demo_screen)
+}
+
+fn run_tui(diagnostics_path: Option<PathBuf>, demo_screen: Option<DemoScreen>) -> Result<()> {
     let logs = Arc::new(Mutex::new(LogBuffer::new(1000)));
-    setup_tracing(logs.clone());
+    let diagnostics = match diagnostics_path.as_deref() {
+        Some(path) => Some(Arc::new(Mutex::new(File::create(path)?))),
+        None => None,
+    };
+    setup_tracing(logs.clone(), diagnostics);
+    if let Some(path) = diagnostics_path {
+        tracing::info!("Writing detailed diagnostics to {}", path.display());
+    }
 
     let mut terminal = setup_terminal()?;
     let tick_rate = Duration::from_millis(80);
     let mut last_tick = Instant::now();
     let mut app = App::new(logs);
+    if let Some(screen) = demo_screen {
+        configure_demo_screen(&mut app, screen);
+    }
 
     loop {
-        update_download_state(&mut app);
-        update_loading_state(&mut app);
+        if demo_screen.is_none() {
+            update_download_state(&mut app);
+            update_loading_state(&mut app);
+        }
         terminal.draw(|f| ui(f, &mut app))?;
 
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -194,6 +447,9 @@ fn handle_key_event(
 ) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
+    }
+    if app.confirm.is_some() {
+        return handle_confirm_keys(app, key);
     }
 
     match app.screen {
@@ -247,15 +503,66 @@ fn handle_menu_keys(
                 "Logout" => {
                     keystore::Keystore::logout()?;
                     keystore::Keystore::clear_auth_cookie()?;
-                    app.status = "Logged out".to_string();
+                    catalog::SongCatalog::open()?.clear()?;
+                    kv_core::download_progress::DownloadProgress::new().clear()?;
+                    app.songs.clear();
+                    app.all_songs.clear();
+                    app.song_filter.clear();
+                    app.status = "Logged out; local catalog and download progress cleared".to_string();
                     app.refresh_menu();
                 }
                 "Browse My Songs" => {
                     app.status = "".to_string();
+                    app.songs_mode = SongsMode::Browse;
+                    let cached = catalog::SongCatalog::open()?.list()?;
+                    if cached.is_empty() {
+                        match cookie_value() {
+                            Ok(cookie) => start_loading_songs(app, cookie, false),
+                            Err(err) => app.status = format!("Not authenticated: {}", err),
+                        }
+                    } else {
+                        set_song_list(app, cached);
+                        if let Ok(cookie) = cookie_value() {
+                            start_loading_songs(app, cookie, false);
+                        }
+                    }
+                }
+                "Resync Songs List" => {
+                    app.status = "".to_string();
+                    app.songs_mode = SongsMode::Browse;
                     match cookie_value() {
-                        Ok(cookie) => start_loading_songs(app, cookie),
+                        Ok(cookie) => start_loading_songs(app, cookie, true),
                         Err(err) => app.status = format!("Not authenticated: {}", err),
                     }
+                }
+                "Reset Song Progress" => {
+                    app.status = "".to_string();
+                    app.songs_mode = SongsMode::ResetProgress;
+                    let progress = kv_core::download_progress::DownloadProgress::new();
+                    let tracked = progress
+                        .tracked_song_urls()?
+                        .into_iter()
+                        .collect::<std::collections::HashSet<_>>();
+                    let songs = catalog::SongCatalog::open()?
+                        .list()?
+                        .into_iter()
+                        .filter(|song| tracked.contains(&song.url))
+                        .collect::<Vec<_>>();
+                    if songs.is_empty() {
+                        app.status = "No saved song progress to reset".to_string();
+                    } else {
+                        set_song_list(app, songs);
+                    }
+                }
+                "Reset All Download Progress" => {
+                    app.confirm = Some(ConfirmState {
+                        message: vec![
+                            "Delete the entire download progress file?".to_string(),
+                            "All completed-track history in this file will be lost.".to_string(),
+                        ],
+                        selected: 1,
+                        payload: ConfirmPayload::ResetAllProgress,
+                    });
                 }
                 "Quit" => return Ok(true),
                 _ => {}
@@ -268,11 +575,70 @@ fn handle_menu_keys(
     Ok(false)
 }
 
+fn set_song_list(app: &mut App, songs: Vec<Song>) {
+    app.all_songs = songs;
+    apply_song_view(app);
+    app.screen = Screen::Songs;
+}
+
+fn apply_song_view(app: &mut App) {
+    let filter = app.song_filter.to_lowercase();
+    app.songs = app
+        .all_songs
+        .iter()
+        .filter(|song| {
+            filter.is_empty()
+                || song.title.to_lowercase().contains(&filter)
+                || song.artist.to_lowercase().contains(&filter)
+        })
+        .cloned()
+        .collect();
+    match app.song_sort {
+        SongSort::DateDescending => app.songs.sort_by(|left, right| {
+            right
+                .purchase_date
+                .cmp(&left.purchase_date)
+                .then_with(|| right.first_seen.cmp(&left.first_seen))
+                .then_with(|| left.artist.to_lowercase().cmp(&right.artist.to_lowercase()))
+                .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+        }),
+        SongSort::Artist => app.songs.sort_by(|left, right| {
+            left.artist
+                .to_lowercase()
+                .cmp(&right.artist.to_lowercase())
+                .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+        }),
+        SongSort::Title => app
+            .songs
+            .sort_by_key(|song| (song.title.to_lowercase(), song.artist.to_lowercase())),
+    }
+    app.songs_state = ListState::default();
+    if !app.songs.is_empty() {
+        app.songs_state.select(Some(0));
+    }
+}
+
 fn handle_songs_keys(
     _terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     key: KeyEvent,
 ) -> Result<bool> {
+    if app.editing_song_filter {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => app.editing_song_filter = false,
+            KeyCode::Backspace => {
+                app.song_filter.pop();
+                apply_song_view(app);
+            }
+            KeyCode::Char(character) => {
+                app.song_filter.push(character);
+                apply_song_view(app);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     match key.code {
         KeyCode::Esc => {
             app.screen = Screen::Menu;
@@ -299,13 +665,36 @@ fn handle_songs_keys(
                 app.songs_state.select(Some(next));
             }
         }
+        KeyCode::Char('/') => {
+            app.editing_song_filter = true;
+        }
+        KeyCode::Char('s') => {
+            app.song_sort = app.song_sort.next();
+            apply_song_view(app);
+        }
         KeyCode::Enter => {
             if let Some(idx) = app.songs_state.selected() {
                 if let Some(song) = app.songs.get(idx).cloned() {
                     app.status = "".to_string();
-                    match cookie_value() {
-                        Ok(cookie) => start_loading_tracks(app, cookie, song),
-                        Err(err) => app.status = format!("Not authenticated: {}", err),
+                    match app.songs_mode {
+                        SongsMode::Browse => match cookie_value() {
+                            Ok(cookie) => start_loading_tracks(app, cookie, song),
+                            Err(err) => app.status = format!("Not authenticated: {}", err),
+                        },
+                        SongsMode::ResetProgress => {
+                            app.confirm = Some(ConfirmState {
+                                message: vec![
+                                    format!("Reset all saved progress for '{}' by {}?", song.title, song.artist),
+                                    "All count-in and transpose variants for this song will be removed."
+                                        .to_string(),
+                                ],
+                                selected: 1,
+                                payload: ConfirmPayload::ResetSong {
+                                    url: song.url,
+                                    title: song.title,
+                                },
+                            });
+                        }
                     }
                 }
             }
@@ -441,7 +830,7 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -450,19 +839,27 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
 
     let logo = vec![
         Line::from(Span::styled(
-            r"   __ ___   __  ___                  __             __       ",
+            r"██╗  ██╗██╗   ██╗      ██████╗  ██████╗ ██╗    ██╗███╗   ██╗██╗      ██████╗  █████╗ ██████╗ ███████╗██████╗ ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            r"  / //_/ | / / / _ \___ _    _____  / /__  ___ ____/ /__ ____",
+            r"██║ ██╔╝██║   ██║      ██╔══██╗██╔═══██╗██║    ██║████╗  ██║██║     ██╔═══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            r" / ,<  | |/ / / // / _ \ |/|/ / _ \/ / _ \/ _ `/ _  / -_) __/",
+            r"█████╔╝ ██║   ██║█████╗██║  ██║██║   ██║██║ █╗ ██║██╔██╗ ██║██║     ██║   ██║███████║██║  ██║█████╗  ██████╔╝",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            r"/_/|_| |___/ /____/\___/__,__/_//_/_/\___/\_,_/\_,_/\__/_/   ",
+            r"██╔═██╗ ╚██╗ ██╔╝╚════╝██║  ██║██║   ██║██║███╗██║██║╚██╗██║██║     ██║   ██║██╔══██║██║  ██║██╔══╝  ██╔══██╗",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            r"██║  ██╗ ╚████╔╝       ██████╔╝╚██████╔╝╚███╔███╔╝██║ ╚████║███████╗╚██████╔╝██║  ██║██████╔╝███████╗██║  ██║",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            r"╚═╝  ╚═╝  ╚═══╝        ╚═════╝  ╚═════╝  ╚══╝╚══╝ ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
     ];
@@ -539,10 +936,27 @@ fn render_songs(frame: &mut ratatui::Frame, app: &mut App) {
         .map(|song| ListItem::new(format!("{} - {}", song.title, song.artist)))
         .collect();
 
+    let base_title = match app.songs_mode {
+        SongsMode::Browse => "My Songs",
+        SongsMode::ResetProgress => "Choose Song to Reset Progress",
+    };
+    let filter = if app.song_filter.is_empty() {
+        String::new()
+    } else {
+        format!(" | Filter: {}", app.song_filter)
+    };
+    let editing = if app.editing_song_filter { " [typing]" } else { "" };
+    let title = format!(
+        "{} | Sort: {}{}{}",
+        base_title,
+        app.song_sort.label(),
+        filter,
+        editing
+    );
     let list = List::new(items)
         .block(
             Block::default()
-                .title("My Songs")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -551,7 +965,11 @@ fn render_songs(frame: &mut ratatui::Frame, app: &mut App) {
 
     frame.render_stateful_widget(list, chunks[0], &mut app.songs_state);
 
-    let help = Paragraph::new("Enter: open song | ESC: menu")
+    let help_text = match app.songs_mode {
+        SongsMode::Browse => "Enter: open | /: filter | s: sort | ESC: menu",
+        SongsMode::ResetProgress => "Enter: reset | /: filter | s: sort | ESC: menu",
+    };
+    let help = Paragraph::new(help_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -707,8 +1125,13 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                     TrackStatus::Pending => Style::default().fg(Color::Gray),
                 };
+                let attempt = match track.status {
+                    TrackStatus::Downloading => format!(" (attempt {}/3)", track.attempt.max(1)),
+                    TrackStatus::Failed => " (failed after 3 attempts)".to_string(),
+                    _ => String::new(),
+                };
                 ListItem::new(Line::from(Span::styled(
-                    format!("{} {}", marker, track.name),
+                    format!("{} {}{}", marker, track.name, attempt),
                     style,
                 )))
             })
@@ -736,7 +1159,9 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
         .len()
         .saturating_sub(visible_lines)
         .min(u16::MAX as usize) as u16;
-    if app.log_scroll > max_scroll {
+    if app.log_follow {
+        app.log_scroll = max_scroll;
+    } else if app.log_scroll > max_scroll {
         app.log_scroll = max_scroll;
     }
     let log_text = logs.iter().map(|line| parse_ansi_line(line)).collect::<Vec<_>>();
@@ -751,7 +1176,7 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
         .scroll((app.log_scroll, 0));
     frame.render_widget(log_block, columns[1]);
 
-    let footer = Paragraph::new("Up/Down: scroll logs | ESC: menu (after finish)")
+    let footer = Paragraph::new("Up/Down: scroll logs | End: follow latest | ESC: menu (after finish)")
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -770,11 +1195,24 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Min(3), Constraint::Length(7)].as_ref())
         .split(frame.size());
 
+    let (heading, heading_color) = match download.done.as_ref() {
+        Some(Ok(())) => ("Download complete", Color::Green),
+        Some(Err(_)) => ("Download finished with errors", Color::Red),
+        None => ("Download finished", Color::Yellow),
+    };
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
-        "Download complete",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        heading,
+        Style::default()
+            .fg(heading_color)
+            .add_modifier(Modifier::BOLD),
     )));
+    if let Some(Err(error)) = download.done.as_ref() {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(format!(
         "Song: {} - {}",
@@ -791,9 +1229,27 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
         download.download_dir.display()
     )));
     lines.push(Line::from(""));
-    lines.push(Line::from("Tracks:"));
+    let completed = download
+        .tracks
+        .iter()
+        .filter(|track| track.status == TrackStatus::Done)
+        .count();
+    let failed = download
+        .tracks
+        .iter()
+        .filter(|track| track.status == TrackStatus::Failed)
+        .count();
+    lines.push(Line::from(format!(
+        "Tracks: {} completed, {} failed",
+        completed, failed
+    )));
     for track in &download.tracks {
-        lines.push(Line::from(format!("  - {}", track.name)));
+        let marker = match track.status {
+            TrackStatus::Done => "✓",
+            TrackStatus::Failed => "✗",
+            _ => "-",
+        };
+        lines.push(Line::from(format!("  {} {}", marker, track.name)));
     }
 
     let details = Paragraph::new(Text::from(lines))
@@ -882,6 +1338,7 @@ fn login_flow() -> Result<()> {
         download_path: None,
         idle_browser_timeout: Duration::from_secs(300),
     };
+    tracing::info!("Launching Chromium for login (headless: false)");
     let driver = driver::Driver::new(config);
     driver.sign_in(&user, &pass)?;
 
@@ -904,7 +1361,9 @@ fn start_download(
         } else {
             Some(selected_tracks)
         },
+        force_restart: false,
     };
+    tracing::info!("Using HTTP downloader");
     tasks::download_song::download_song_http(song_url, download_options, None, &domain)?;
     Ok(())
 }
@@ -933,22 +1392,85 @@ fn cookie_value() -> Result<String> {
     keystore::Keystore::get_auth_cookie_value()
 }
 
-fn fetch_songs(cookie: &str) -> Result<Vec<Song>> {
+fn sync_song_catalog(cookie: &str, full_resync: bool) -> Result<Vec<Song>> {
+    let catalog = catalog::SongCatalog::open()?;
+    let mut first_url = Url::parse("https://www.karaoke-version.com/my/download.html")?;
+    first_url
+        .query_pairs_mut()
+        .append_pair("orderField", "add_date")
+        .append_pair("orderSort", "desc");
+
+    let mut next_url = Some(first_url.to_string());
+    let mut discovered = Vec::new();
+    let mut visited_pages = std::collections::HashSet::new();
+    while let Some(page_url) = next_url.take() {
+        if !visited_pages.insert(page_url.clone()) {
+            break;
+        }
+        tracing::info!("Syncing songs page {}", page_url);
+        let (songs, next) = fetch_songs_page(cookie, &page_url)?;
+        let mut reached_cached_song = false;
+        for song in songs {
+            if !full_resync && catalog.contains(&song.url)? {
+                reached_cached_song = true;
+                break;
+            }
+            discovered.push(song);
+        }
+        if reached_cached_song {
+            tracing::info!("Reached previously cached song; incremental sync complete");
+            break;
+        }
+        next_url = next;
+        if visited_pages.len() >= 500 {
+            return Err(anyhow!("Stopped song sync after 500 pages"));
+        }
+    }
+
+    if full_resync {
+        catalog.clear()?;
+    }
+    catalog.upsert(&discovered)?;
+    let songs = catalog.list()?;
+    tracing::info!(
+        "Song catalog sync complete: {} discovered, {} cached total",
+        discovered.len(),
+        songs.len()
+    );
+    Ok(songs)
+}
+
+fn fetch_songs_page(cookie: &str, page_url: &str) -> Result<(Vec<Song>, Option<String>)> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("kv-downloader-tui")
         .build()?;
 
     let res = client
-        .get("https://www.karaoke-version.com/my/download.html")
+        .get(page_url)
         .header("Cookie", format!("karaoke-version={}", cookie))
         .send()?;
 
-    let body = res.text()?;
+    let final_url = res.url().clone();
+    let mut body = res.text()?;
+    if is_browser_verification_page(&body) {
+        tracing::warn!("Browser verification interrupted song browsing; opening Chromium");
+        body = fetch_page_in_visible_browser(
+            page_url,
+            cookie,
+            "my-downloaded-files",
+        )?;
+    }
+    if is_login_page(&body, final_url.as_str()) {
+        return Err(anyhow!(
+            "Your saved session is no longer accepted. Choose Login to refresh it."
+        ));
+    }
     let doc = Html::parse_document(&body);
 
     let row_selector = Selector::parse("table.my-downloaded-files tr.vam").unwrap();
     let song_selector = Selector::parse("td.my-downloaded-files__song a").unwrap();
     let artist_selector = Selector::parse("td.my-downloaded-files__artist a").unwrap();
+    let date_selector = Selector::parse("td.my-downloaded-files__date").unwrap();
 
     let mut songs = Vec::new();
     for row in doc.select(&row_selector) {
@@ -967,15 +1489,146 @@ fn fetch_songs(cookie: &str) -> Result<Vec<Song>> {
                 .map(|u| u.to_string())
                 .unwrap_or_else(|_| href.to_string());
 
-            songs.push(Song { title, artist, url });
+            let purchase_date = row
+                .select(&date_selector)
+                .next()
+                .map(|date| normalize_text(date.text()))
+                .and_then(|date| parse_purchase_date(&date))
+                .unwrap_or(0);
+            songs.push(Song {
+                title,
+                artist,
+                url,
+                first_seen: 0,
+                purchase_date,
+            });
         }
     }
 
     if songs.is_empty() {
-        return Err(anyhow!("No songs found. Are you logged in?"));
+        write_kvui_debug_page("kvui_songs.html", &body);
+        return Err(anyhow!(
+            "The download page loaded, but its song list was not recognized. Set KV_HTTP_DEBUG=1 and inspect kvui_songs.html."
+        ));
     }
 
-    Ok(songs)
+    let next_url = find_next_songs_page(&doc, page_url);
+    Ok((songs, next_url))
+}
+
+fn find_next_songs_page(doc: &Html, page_url: &str) -> Option<String> {
+    let selector = Selector::parse("a[rel='next'], a.next, .pagination a, .pager a").ok()?;
+    let base = Url::parse(page_url).ok()?;
+    for link in doc.select(&selector) {
+        let text = normalize_text(link.text()).to_lowercase();
+        let class = link.value().attr("class").unwrap_or("").to_lowercase();
+        let rel = link.value().attr("rel").unwrap_or("").to_lowercase();
+        let is_next = rel.contains("next")
+            || class.contains("next")
+            || text.contains("next")
+            || text.contains("read all")
+            || text == ">"
+            || text == "›";
+        if is_next {
+            if let Some(href) = link.value().attr("href") {
+                if let Ok(mut url) = base.join(href) {
+                    if !url.query_pairs().any(|(key, _)| key == "orderField") {
+                        url.query_pairs_mut()
+                            .append_pair("orderField", "add_date")
+                            .append_pair("orderSort", "desc");
+                    }
+                    return Some(url.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_purchase_date(value: &str) -> Option<i64> {
+    let mut parts = value.split('/');
+    let month = parts.next()?.parse::<i64>().ok()?;
+    let day = parts.next()?.parse::<i64>().ok()?;
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let year = if year < 100 { 2000 + year } else { year };
+    Some(year * 10_000 + month * 100 + day)
+}
+
+fn is_browser_verification_page(html: &str) -> bool {
+    let normalized = html.to_lowercase();
+    normalized.contains("cdn-cgi/challenge-platform")
+        || normalized.contains("cf-challenge")
+        || normalized.contains("cf-turnstile")
+        || normalized.contains("__cf_chl")
+        || normalized.contains("verify you are human")
+        || normalized.contains("just a moment")
+        || normalized.contains("fastly")
+        || normalized.contains("<title>client challenge</title>")
+        || normalized.contains("/_fs-ch-")
+        || normalized.contains("guru meditation")
+        || normalized.contains("varnish cache server")
+}
+
+fn fetch_page_in_visible_browser(
+    url: &str,
+    session_cookie: &str,
+    expected_content: &str,
+) -> Result<String> {
+    let config = driver::Config {
+        domain: "www.karaoke-version.com".to_string(),
+        headless: false,
+        download_path: None,
+        idle_browser_timeout: Duration::from_secs(300),
+    };
+    let driver = driver::Driver::new(config);
+    let tab = driver.browser.new_tab()?;
+    tab.navigate_to("https://www.karaoke-version.com")?
+        .wait_until_navigated()?;
+    driver.set_session_cookie(&tab, session_cookie)?;
+    tab.navigate_to(url)?.wait_until_navigated()?;
+
+    tracing::warn!(
+        "Complete browser verification or sign in in Chromium. Waiting for the requested page..."
+    );
+    let started = Instant::now();
+    let mut last_navigation = Instant::now();
+    loop {
+        let html = tab.get_content()?;
+        if html.contains(expected_content) {
+            tracing::info!("Requested page loaded in Chromium");
+            return Ok(html);
+        }
+
+        if started.elapsed() >= Duration::from_secs(300) {
+            return Err(anyhow!("Timed out waiting for the requested page in Chromium"));
+        }
+
+        if !is_browser_verification_page(&html)
+            && !is_login_page(&html, &tab.get_url())
+            && last_navigation.elapsed() >= Duration::from_secs(3)
+        {
+            tab.navigate_to(url)?.wait_until_navigated()?;
+            last_navigation = Instant::now();
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn is_login_page(html: &str, final_url: &str) -> bool {
+    final_url.contains("/my/login")
+        || html.contains("id=\"frm_login\"")
+        || html.contains("name=\"frm_login\"")
+}
+
+fn write_kvui_debug_page(filename: &str, html: &str) {
+    if std::env::var("KV_HTTP_DEBUG").ok().as_deref() != Some("1") {
+        return;
+    }
+    if let Err(err) = std::fs::write(filename, html) {
+        tracing::warn!("Failed to write {}: {}", filename, err);
+    } else {
+        tracing::debug!("Wrote debug page to {}", filename);
+    }
 }
 
 fn fetch_song_details(cookie: &str, song_url: &str) -> Result<SongDetails> {
@@ -988,7 +1641,18 @@ fn fetch_song_details(cookie: &str, song_url: &str) -> Result<SongDetails> {
         .header("Cookie", format!("karaoke-version={}", cookie))
         .send()?;
 
-    let body = res.text()?;
+    let final_url = res.url().clone();
+    let mut body = res.text()?;
+    if is_browser_verification_page(&body) {
+        tracing::warn!("Browser verification interrupted track loading; opening Chromium");
+        body = fetch_page_in_visible_browser(song_url, cookie, "track__caption")?;
+    }
+    if is_login_page(&body, final_url.as_str()) {
+        return Err(anyhow!(
+            "Your saved session is no longer accepted. Choose Login to refresh it."
+        ));
+    }
+    write_kvui_debug_page("kvui_song.html", &body);
     let doc = Html::parse_document(&body);
 
     let track_selector = Selector::parse("div.track").unwrap();
@@ -1015,7 +1679,7 @@ fn fetch_song_details(cookie: &str, song_url: &str) -> Result<SongDetails> {
         } else {
             normalize_text(segments.iter().copied())
         };
-        if name.is_empty() {
+        if name.is_empty() || is_precount_track_name(&name) {
             continue;
         }
 
@@ -1023,7 +1687,10 @@ fn fetch_song_details(cookie: &str, song_url: &str) -> Result<SongDetails> {
     }
 
     if tracks.is_empty() {
-        return Err(anyhow!("No tracks found on song page"));
+        write_kvui_debug_page("kvui_song.html", &body);
+        return Err(anyhow!(
+            "The song page loaded, but its tracks were not recognized. Set KV_HTTP_DEBUG=1 and inspect kvui_song.html."
+        ));
     }
 
     let base_key = extract_base_key(&doc, &audio_info_selector);
@@ -1048,12 +1715,19 @@ fn update_download_state(app: &mut App) {
     };
 
     let progress = kv_core::download_progress::DownloadProgress::new();
-    let completed = progress
-        .get_completed_tracks()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|name| normalize_track_name(&name))
-        .collect::<std::collections::HashSet<_>>();
+    let completed = if progress
+        .is_same_download(&download.song.url, download.count_in, download.transpose)
+        .unwrap_or(false)
+    {
+        progress
+            .get_completed_tracks()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| normalize_track_name(&name))
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        std::collections::HashSet::new()
+    };
 
     for track in &mut download.tracks {
         let normalized = normalize_track_name(&track.name);
@@ -1062,18 +1736,21 @@ fn update_download_state(app: &mut App) {
         }
     }
 
-    let latest = latest_processing_track(app.logs.clone());
-    if let Some(current) = latest {
-        for track in &mut download.tracks {
-            if track.status == TrackStatus::Pending
-                && normalize_track_name(&track.name) == normalize_track_name(&current)
-            {
-                track.status = TrackStatus::Downloading;
-            } else if track.status == TrackStatus::Downloading
-                && normalize_track_name(&track.name) != normalize_track_name(&current)
-            {
-                track.status = TrackStatus::Pending;
-            }
+    let log_progress = track_log_progress(app.logs.clone());
+    for track in &mut download.tracks {
+        if track.status == TrackStatus::Done {
+            continue;
+        }
+        let normalized = normalize_track_name(&track.name);
+        if log_progress.failed.contains(&normalized) {
+            track.status = TrackStatus::Failed;
+            track.attempt = 3;
+        } else if log_progress.current.as_deref() == Some(normalized.as_str()) {
+            track.status = TrackStatus::Downloading;
+            track.attempt = log_progress.attempts.get(&normalized).copied().unwrap_or(1);
+        } else {
+            track.status = TrackStatus::Pending;
+            track.attempt = log_progress.attempts.get(&normalized).copied().unwrap_or(0);
         }
     }
 
@@ -1097,18 +1774,24 @@ fn update_download_state(app: &mut App) {
                 }
                 Ok(Err(err)) => {
                     for track in &mut download.tracks {
-                        if track.status == TrackStatus::Pending
-                            || track.status == TrackStatus::Downloading
-                        {
+                        if track.status == TrackStatus::Downloading {
                             track.status = TrackStatus::Failed;
                         }
                     }
+                    tracing::error!("Download failed: {}", err);
                     download.done = Some(Err(err.to_string()));
-                    app.status = "Download failed".to_string();
+                    download.duration = Some(download.started_at.elapsed());
+                    app.status = format!("Download finished with errors: {}", err);
+                    app.done_menu_index = 0;
+                    app.screen = Screen::DownloadDone;
                 }
                 Err(_) => {
+                    tracing::error!("Download thread panicked");
                     download.done = Some(Err("Download thread panicked".to_string()));
-                    app.status = "Download failed".to_string();
+                    download.duration = Some(download.started_at.elapsed());
+                    app.status = "Download failed: download thread panicked".to_string();
+                    app.done_menu_index = 0;
+                    app.screen = Screen::DownloadDone;
                 }
             }
         }
@@ -1118,10 +1801,15 @@ fn update_download_state(app: &mut App) {
 fn handle_download_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Up => {
+            app.log_follow = false;
             app.log_scroll = app.log_scroll.saturating_sub(1);
         }
         KeyCode::Down => {
+            app.log_follow = false;
             app.log_scroll = app.log_scroll.saturating_add(1);
+        }
+        KeyCode::End => {
+            app.log_follow = true;
         }
         KeyCode::Esc => {
             if app.download.as_ref().and_then(|d| d.done.as_ref()).is_some() {
@@ -1172,21 +1860,58 @@ fn handle_done_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
-fn latest_processing_track(logs: Arc<Mutex<LogBuffer>>) -> Option<String> {
-    let Ok(buf) = logs.lock() else {
-        return None;
+struct TrackLogProgress {
+    current: Option<String>,
+    attempts: std::collections::HashMap<String, u8>,
+    failed: std::collections::HashSet<String>,
+}
+
+fn track_log_progress(logs: Arc<Mutex<LogBuffer>>) -> TrackLogProgress {
+    let mut progress = TrackLogProgress {
+        current: None,
+        attempts: std::collections::HashMap::new(),
+        failed: std::collections::HashSet::new(),
     };
-    for line in buf.lines.iter().rev() {
-        if let Some(idx) = line.find("Processing track") {
-            if let Some(start) = line[idx..].find('\'') {
-                let rest = &line[idx + start + 1..];
-                if let Some(end) = rest.find('\'') {
-                    return Some(rest[..end].to_string());
-                }
+    let Ok(buf) = logs.lock() else {
+        return progress;
+    };
+
+    for line in &buf.lines {
+        if line.contains("Processing track") {
+            if let Some(track) = quoted_track_name(line) {
+                progress.current = Some(normalize_track_name(&track));
+            }
+        }
+        if let Some(index) = line.find("Attempt ") {
+            let attempt = line[index + "Attempt ".len()..]
+                .split('/')
+                .next()
+                .and_then(|value| value.parse::<u8>().ok());
+            if let (Some(attempt), Some(track)) = (attempt, quoted_track_name(line)) {
+                let track = normalize_track_name(&track);
+                progress.attempts.insert(track.clone(), attempt);
+                progress.current = Some(track);
+            }
+        }
+        if line.contains("Giving up on") {
+            if let Some(track) = quoted_track_name(line) {
+                progress.failed.insert(normalize_track_name(&track));
             }
         }
     }
-    None
+    progress
+}
+
+fn quoted_track_name(line: &str) -> Option<String> {
+    let start = line.find('\'')?;
+    let rest = &line[start + 1..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+fn is_precount_track_name(value: &str) -> bool {
+    let normalized = value.to_lowercase();
+    normalized.contains("intro count") || normalized.contains("precount")
 }
 
 fn normalize_track_name(value: &str) -> String {
@@ -1210,10 +1935,13 @@ enum TrackStatus {
 struct TrackStatusItem {
     name: String,
     status: TrackStatus,
+    attempt: u8,
 }
 
 struct DownloadState {
     song: Song,
+    count_in: bool,
+    transpose: i8,
     tracks: Vec<TrackStatusItem>,
     handle: Option<JoinHandle<Result<()>>>,
     done: Option<Result<(), String>>,
@@ -1257,6 +1985,11 @@ enum ConfirmPayload {
         intro_click: bool,
         key_shift: i8,
     },
+    ResetSong {
+        url: String,
+        title: String,
+    },
+    ResetAllProgress,
 }
 
 impl LogBuffer {
@@ -1282,6 +2015,7 @@ impl LogBuffer {
 
 struct LogWriter {
     buffer: Arc<Mutex<LogBuffer>>,
+    diagnostics: Option<Arc<Mutex<File>>>,
 }
 
 impl Write for LogWriter {
@@ -1292,20 +2026,40 @@ impl Write for LogWriter {
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "log buffer poisoned"))?;
         guard.partial.push_str(&text);
+        let mut completed_lines = Vec::new();
         while let Some(pos) = guard.partial.find('\n') {
             let line = guard.partial.drain(..=pos).collect::<String>();
-            guard.push_line(line.trim_end().to_string());
+            let line = line.trim_end().to_string();
+            guard.push_line(line.clone());
+            completed_lines.push(line);
+        }
+        drop(guard);
+
+        if let Some(diagnostics) = &self.diagnostics {
+            let mut file = diagnostics
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "diagnostics file poisoned"))?;
+            for line in completed_lines {
+                writeln!(file, "{}", strip_ansi_codes(&line))?;
+            }
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics
+                .lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "diagnostics file poisoned"))?
+                .flush()?;
+        }
         Ok(())
     }
 }
 
 struct LogWriterFactory {
     buffer: Arc<Mutex<LogBuffer>>,
+    diagnostics: Option<Arc<Mutex<File>>>,
 }
 
 impl<'a> MakeWriter<'a> for LogWriterFactory {
@@ -1314,6 +2068,7 @@ impl<'a> MakeWriter<'a> for LogWriterFactory {
     fn make_writer(&'a self) -> Self::Writer {
         LogWriter {
             buffer: self.buffer.clone(),
+            diagnostics: self.diagnostics.clone(),
         }
     }
 }
@@ -1331,12 +2086,40 @@ impl LogScope {
     }
 }
 
-fn setup_tracing(buffer: Arc<Mutex<LogBuffer>>) {
-    let writer = LogWriterFactory { buffer };
+fn setup_tracing(buffer: Arc<Mutex<LogBuffer>>, diagnostics: Option<Arc<Mutex<File>>>) {
+    let detailed = diagnostics.is_some();
+    let writer = LogWriterFactory {
+        buffer,
+        diagnostics,
+    };
+    let filter = if detailed {
+        EnvFilter::new("info,kvui=debug,kv_core=debug")
+    } else {
+        EnvFilter::new("info")
+    };
     let _ = tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(true)
+        .with_env_filter(filter)
         .try_init();
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for code in chars.by_ref() {
+                if code.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 fn parse_ansi_line(input: &str) -> Line<'static> {
@@ -1396,14 +2179,18 @@ fn apply_sgr(code: &str, style: &mut Style) {
     }
 }
 
-fn start_loading_songs(app: &mut App, cookie: String) {
+fn start_loading_songs(app: &mut App, cookie: String, full_resync: bool) {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = fetch_songs(&cookie).map_err(|e| e.to_string());
+        let result = sync_song_catalog(&cookie, full_resync).map_err(|e| e.to_string());
         let _ = tx.send(LoadingResult::Songs(result));
     });
     app.loading = Some(LoadingState {
-        message: "Loading your songs...".to_string(),
+        message: if full_resync {
+            "Fully resyncing your song catalog...".to_string()
+        } else {
+            "Syncing your song catalog...".to_string()
+        },
         kind: LoadingKind::Songs,
         receiver: rx,
     });
@@ -1437,12 +2224,9 @@ fn update_loading_state(app: &mut App) {
             app.loading = None;
             match (kind, result) {
                 (LoadingKind::Songs, LoadingResult::Songs(Ok(songs))) => {
-                    app.songs = songs;
-                    app.songs_state = ListState::default();
-                    if !app.songs.is_empty() {
-                        app.songs_state.select(Some(0));
-                    }
-                    app.screen = Screen::Songs;
+                    let count = songs.len();
+                    set_song_list(app, songs);
+                    app.status = format!("{} songs cached locally", count);
                 }
                 (LoadingKind::Songs, LoadingResult::Songs(Err(err))) => {
                     app.status = format!("Failed to load songs: {}", err);
@@ -1598,38 +2382,61 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::Enter => {
             let confirm = app.confirm.take().unwrap();
             match confirm.selected {
-                0 => {
-                    let ConfirmPayload::StartDownload {
+                0 => match confirm.payload {
+                    ConfirmPayload::StartDownload {
                         song,
                         selected_tracks,
                         intro_click,
                         key_shift,
-                    } = confirm.payload;
-                    let download_dir =
-                        default_download_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let download_tracks = selected_tracks
-                        .iter()
-                        .map(|name| TrackStatusItem {
-                            name: name.clone(),
-                            status: TrackStatus::Pending,
-                        })
-                        .collect::<Vec<_>>();
-                    let song_url = song.url.clone();
-                    let logs = app.logs.clone();
-                    let handle = std::thread::spawn(move || {
-                        let _guard = LogScope::new(logs);
-                        start_download(&song_url, intro_click, key_shift, selected_tracks)
-                    });
-                    app.download = Some(DownloadState {
-                        song,
-                        tracks: download_tracks,
-                        handle: Some(handle),
-                        done: None,
-                        started_at: Instant::now(),
-                        duration: None,
-                        download_dir,
-                    });
-                    app.screen = Screen::DownloadStatus;
+                    } => {
+                        app.log_scroll = 0;
+                        app.log_follow = true;
+                        let download_dir = default_download_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let download_tracks = selected_tracks
+                            .iter()
+                            .map(|name| TrackStatusItem {
+                                name: name.clone(),
+                                status: TrackStatus::Pending,
+                                attempt: 0,
+                            })
+                            .collect::<Vec<_>>();
+                        let song_url = song.url.clone();
+                        let logs = app.logs.clone();
+                        let handle = std::thread::spawn(move || {
+                            let _guard = LogScope::new(logs);
+                            start_download(&song_url, intro_click, key_shift, selected_tracks)
+                        });
+                        app.download = Some(DownloadState {
+                            song,
+                            count_in: intro_click,
+                            transpose: key_shift,
+                            tracks: download_tracks,
+                            handle: Some(handle),
+                            done: None,
+                            started_at: Instant::now(),
+                            duration: None,
+                            download_dir,
+                        });
+                        app.screen = Screen::DownloadStatus;
+                    }
+                    ConfirmPayload::ResetSong { url, title } => {
+                        let progress = kv_core::download_progress::DownloadProgress::new();
+                        if progress.clear_song(&url)? {
+                            tracing::info!("Reset download progress for {}", url);
+                            app.status = format!("Reset download progress for '{}'", title);
+                        } else {
+                            app.status = format!("No saved download progress found for '{}'", title);
+                        }
+                        app.screen = Screen::Menu;
+                    }
+                    ConfirmPayload::ResetAllProgress => {
+                        let progress = kv_core::download_progress::DownloadProgress::new();
+                        let path = progress.path().display().to_string();
+                        progress.clear()?;
+                        tracing::info!("Deleted download progress file {}", path);
+                        app.status = "All download progress reset".to_string();
+                    }
                 }
                 _ => {}
             }
@@ -1751,4 +2558,30 @@ fn format_duration(duration: Duration) -> String {
     let minutes = total_secs / 60;
     let seconds = total_secs % 60;
     format!("{}m {}s", minutes, seconds)
+}
+
+#[cfg(test)]
+mod song_catalog_tests {
+    use super::{find_next_songs_page, parse_purchase_date, Html};
+
+    #[test]
+    fn parses_purchase_date_for_local_sorting() {
+        assert_eq!(parse_purchase_date("2/6/26"), Some(20260206));
+        assert_eq!(parse_purchase_date("11/17/2025"), Some(20251117));
+    }
+
+    #[test]
+    fn follows_next_page_and_preserves_date_sort() {
+        let document = Html::parse_document(
+            r#"<div class="pagination"><a rel="next" href="/my/download.html?page=2">Next &gt;</a></div>"#,
+        );
+        let next = find_next_songs_page(
+            &document,
+            "https://www.karaoke-version.com/my/download.html?orderField=add_date&orderSort=desc",
+        )
+        .unwrap();
+        assert!(next.contains("page=2"));
+        assert!(next.contains("orderField=add_date"));
+        assert!(next.contains("orderSort=desc"));
+    }
 }

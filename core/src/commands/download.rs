@@ -6,7 +6,7 @@ use crate::{
     tasks,
 };
 use anyhow::{anyhow, Result};
-use clap::{arg, command, Args};
+use clap::Args;
 
 #[derive(Debug, Args)]
 #[command(flatten_help = true)]
@@ -58,13 +58,6 @@ impl Download {
     }
 
     fn start_download(args: DownloadArgs) -> Result<()> {
-        let credentials = credentials_from_env().unwrap_or(
-            keystore::Keystore::get_credentials().map_err(|e| {
-                tracing::error!("credential error: {}", e);
-                anyhow!("Must call `kv-downloader auth` first")
-            })?,
-        );
-
         tracing::debug!(args = format!("cli args: {:?}", args));
 
         if !args.browser {
@@ -72,9 +65,10 @@ impl Download {
                 count_in: args.count_in,
                 transpose: args.transpose.unwrap_or(0),
                 selected_tracks: None,
+                force_restart: args.force_restart,
             };
-            let domain =
-                extract_domain_from_url(&args.song_url).expect("missing domain from url");
+            tracing::info!("Using HTTP downloader");
+            let domain = extract_domain_from_url(&args.song_url).expect("missing domain from url");
             tasks::download_song::download_song_http(
                 &args.song_url,
                 download_options,
@@ -84,6 +78,11 @@ impl Download {
             return Ok(());
         }
 
+        tracing::info!(
+            "Using Chromium browser automation (headless: {})",
+            args.headless
+        );
+
         let config = driver::Config {
             domain: extract_domain_from_url(&args.song_url).expect("missing domain from url"),
             headless: args.headless,
@@ -92,26 +91,13 @@ impl Download {
         };
         let driver = driver::Driver::new(config);
 
-        // Handle resume/restart logic
-        if args.force_restart {
-            tracing::info!("Force restart requested, clearing previous progress");
-            driver.progress.clear()?;
-        } else if driver.progress.is_same_url(&args.song_url)? {
-            let completed = driver.progress.get_completed_tracks()?;
-            if !completed.is_empty() {
-                tracing::info!(
-                    "Resuming previous download. Already completed {} tracks:",
-                    completed.len()
-                );
-                for track in &completed {
-                    tracing::info!("  ✓ {}", track);
-                }
-            }
-        } else if !driver.progress.get_completed_tracks()?.is_empty() {
-            // Different URL, clear the old progress
-            tracing::info!("Different song detected, clearing previous progress");
-            driver.progress.clear()?;
-        }
+        let credentials = match credentials_from_env() {
+            Some(credentials) => credentials,
+            None => keystore::Keystore::get_credentials().map_err(|e| {
+                tracing::error!("credential error: {}", e);
+                anyhow!("Must call `kv-downloader auth` first")
+            })?,
+        };
 
         driver.sign_in(&credentials.user, &credentials.password)?;
 
@@ -119,6 +105,7 @@ impl Download {
             count_in: args.count_in,
             transpose: args.transpose.unwrap_or(0),
             selected_tracks: None,
+            force_restart: args.force_restart,
         };
         driver.download_song(&args.song_url, download_options)?;
 

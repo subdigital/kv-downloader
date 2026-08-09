@@ -1,2 +1,7 @@
 /target
 .env
+.DS_Store
+kvui-diagnostics.log
+kv_http_song.html
+kvui_song.html
+kvui_songs.html

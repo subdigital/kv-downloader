@@ -1,4 +1,4 @@
-use crate::driver::Driver;
+use crate::driver::{Config, Driver};
 use crate::download_progress::DownloadProgress;
 use crate::keystore::Keystore;
 
@@ -27,6 +27,7 @@ pub struct DownloadOptions {
     pub count_in: bool,
     pub transpose: i8,
     pub selected_tracks: Option<Vec<String>>,
+    pub force_restart: bool,
 }
 
 #[derive(Debug)]
@@ -49,8 +50,12 @@ impl Error for DownloadError {}
 
 impl Driver {
     pub fn download_song(&self, url: &str, options: DownloadOptions) -> Result<()> {
-        // Set the URL in progress tracking
-        self.progress.set_url(url)?;
+        if options.force_restart {
+            self.progress.clear()?;
+        }
+        self.progress
+            .set_download(url, options.count_in, options.transpose)?;
+        self.progress.log_resume_status()?;
 
         let tab = self.browser.new_tab()?;
         self.minimize_tab(&tab);
@@ -129,9 +134,10 @@ impl Driver {
             // Check if track was already downloaded
             if self.progress.is_track_downloaded(&track_name)? {
                 tracing::info!(
-                    "Skipping track {} '{}' (already downloaded)",
+                    "Skipping track {} '{}' (recorded as completed in {})",
                     index + 1,
-                    track_name
+                    track_name,
+                    self.progress.path().display()
                 );
                 continue;
             }
@@ -184,9 +190,7 @@ impl Driver {
                 "Done! All tracks downloaded successfully: {}\n - ",
                 track_names.join("\n - ")
             );
-            // Clear progress file on successful completion
-            self.progress.clear()?;
-            tracing::info!("Progress file cleared");
+            tracing::info!("Progress retained so completed tracks are skipped on future runs");
         } else {
             tracing::warn!(
                 "Download completed with {} failures. Failed tracks:\n - {}",
@@ -555,33 +559,79 @@ pub fn download_song_http(
     domain: &str,
 ) -> Result<()> {
     let progress = DownloadProgress::new_with_path(download_path.as_deref());
-    progress.set_url(url)?;
+    if options.force_restart {
+        tracing::info!("Force restart requested, clearing previous progress");
+        progress.clear()?;
+    }
+    progress.set_download(url, options.count_in, options.transpose)?;
+    progress.log_resume_status()?;
 
     let cookie = Keystore::get_auth_cookie_value()
         .map_err(|_| anyhow!("Missing session cookie. Run `kv-downloader auth` first."))?;
+    let mut cookie_header = format!("karaoke-version={}", cookie);
 
     let client = Client::builder()
         .user_agent("kv-downloader-http")
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS))
         .build()?;
 
-    let song_page = client
+    let mut song_page = client
         .get(url)
-        .header("Cookie", format!("karaoke-version={}", cookie))
+        .timeout(Duration::from_secs(30))
+        .header("Cookie", &cookie_header)
         .send()?
         .text()?;
 
+    write_http_debug_page(download_path.as_deref(), &song_page);
+
+    let mut tried_browser_verification = false;
+    if is_browser_challenge(&song_page) {
+        tracing::warn!("Browser verification challenge detected. Opening a browser window to let you solve it.");
+        cookie_header =
+            resolve_browser_challenge(url, domain, download_path.as_deref(), &cookie)?;
+        tried_browser_verification = true;
+        song_page = client
+            .get(url)
+            .timeout(Duration::from_secs(30))
+            .header("Cookie", &cookie_header)
+            .send()?
+            .text()?;
+
+        if is_browser_challenge(&song_page) {
+            return Err(anyhow!(
+                "Browser verification challenge is still active after browser verification"
+            ));
+        }
+    }
+
+    write_http_debug_page(download_path.as_deref(), &song_page);
     let song_meta = match SongMeta::parse(&song_page) {
         Ok(meta) => meta,
+        Err(err) if !tried_browser_verification => {
+            write_http_debug_page(download_path.as_deref(), &song_page);
+            tracing::warn!(
+                "Song page did not contain expected mixer metadata ({}). Opening a browser window to refresh verification and session state.",
+                err
+            );
+            cookie_header =
+                resolve_browser_challenge(url, domain, download_path.as_deref(), &cookie)?;
+            song_page = client
+                .get(url)
+                .timeout(Duration::from_secs(30))
+                .header("Cookie", &cookie_header)
+                .send()?
+                .text()?;
+            SongMeta::parse(&song_page).map_err(|retry_err| {
+                write_http_debug_page(download_path.as_deref(), &song_page);
+                anyhow!(
+                    "Failed to parse song page after browser verification: {}",
+                    retry_err
+                )
+            })?
+        }
         Err(err) => {
-            if env::var("KV_HTTP_DEBUG").ok().as_deref() == Some("1") {
-                let debug_path = download_path
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("kv_http_song.html");
-                let _ = std::fs::write(&debug_path, song_page);
-                tracing::warn!("Wrote debug html to {}", debug_path.display());
-            }
+            write_http_debug_page(download_path.as_deref(), &song_page);
             return Err(anyhow!("Failed to parse song page: {}", err));
         }
     };
@@ -596,6 +646,9 @@ pub fn download_song_http(
         None => Driver::get_default_download_dir()?,
     };
 
+    let mut failed_tracks = Vec::new();
+    let mut downloaded_files: Vec<PathBuf> = Vec::new();
+
     for (index, track_name) in song_meta.track_names.iter().enumerate() {
         let level_index = song_meta.track_level_indices[index];
 
@@ -604,66 +657,291 @@ pub fn download_song_http(
         }
 
         if progress.is_track_downloaded(track_name)? {
-            tracing::info!("Skipping '{}' (already downloaded)", track_name);
+            tracing::info!(
+                "Skipping '{}' (recorded as completed in {})",
+                track_name,
+                progress.path().display()
+            );
             continue;
         }
 
         tracing::info!("Processing track {} '{}'", level_index, track_name);
 
-        let trackslevels = song_meta.build_trackslevels_solo(level_index)?;
-        if env::var("KV_HTTP_DEBUG").ok().as_deref() == Some("1") {
-            tracing::info!(
-                "HTTP mix params: track='{}' index={} trackslevels={} pannings={}",
+        let mut completed = false;
+        for attempt in 1..=3 {
+            tracing::info!("Attempt {}/3 for '{}'", attempt, track_name);
+            match download_http_track(
+                &client,
+                &cookie_header,
+                domain,
+                &song_meta,
                 track_name,
                 level_index,
-                trackslevels,
-                song_meta.pannings
-            );
+                options.count_in,
+                options.transpose,
+                &download_dir,
+            ) {
+                Ok((decoded, file_path)) => {
+                    if let Some(previous) = downloaded_files
+                        .iter()
+                        .find(|previous| files_are_identical(previous, &file_path).unwrap_or(false))
+                    {
+                        tracing::warn!(
+                            "Rejected '{}' because its contents are identical to '{}'; the server likely returned a stale mix",
+                            decoded,
+                            previous.display()
+                        );
+                        let _ = std::fs::remove_file(&file_path);
+                        if attempt < 3 {
+                            tracing::info!("Retrying '{}' in 5 seconds", track_name);
+                            sleep(Duration::from_secs(5));
+                        }
+                        continue;
+                    }
+
+                    tracing::info!("Downloaded '{}'", decoded);
+                    progress.mark_track_downloaded(track_name)?;
+                    downloaded_files.push(file_path);
+                    completed = true;
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Attempt {}/3 failed for '{}': {}",
+                        attempt,
+                        track_name,
+                        err
+                    );
+                    if attempt < 3 {
+                        tracing::info!("Retrying '{}' in 5 seconds", track_name);
+                        sleep(Duration::from_secs(5));
+                    }
+                }
+            }
         }
-        let pannings = song_meta.pannings.clone();
 
-        let mut params = Vec::new();
-        params.push(("method", "ajax".to_string()));
-        params.push(("famid", song_meta.famid.to_string()));
-        params.push(("precount", if options.count_in { "1" } else { "0" }.to_string()));
-        params.push(("trackslevels", trackslevels));
-        params.push(("pannings", pannings));
-        params.push(("bkac", song_meta.bkac.clone()));
-        params.push(("s", song_meta.song_id.to_string()));
-        params.push(("prodid", song_meta.prod_id.to_string()));
-        params.push(("pitch", options.transpose.to_string()));
-
-        let basket_url = format!("https://{}/basket.php", domain);
-        client
-            .get(&basket_url)
-            .query(&params)
-            .header("Cookie", format!("karaoke-version={}", cookie))
-            .header("X-Requested-With", "XMLHttpRequest")
-            .send()?;
-
-        let begin_url = format!(
-            "https://{}/my/begin_download.html?id={}&famid={}",
-            domain, song_meta.prod_id, song_meta.famid
-        );
-
-        let file_url = poll_for_file_url(&client, &cookie, &begin_url)?;
-        let filename = file_url
-            .split('/')
-            .last()
-            .ok_or_else(|| anyhow!("Missing filename in download url"))?;
-        let decoded = urlencoding::decode(filename)
-            .map_err(|e| anyhow!("Failed to decode filename: {}", e))?
-            .to_string();
-
-        let file_path = download_dir.join(&decoded);
-        download_file(&client, &file_url, &file_path)?;
-
-        tracing::info!("Downloaded '{}'", decoded);
-        progress.mark_track_downloaded(track_name)?;
+        if !completed {
+            tracing::error!("Giving up on '{}' after 3 attempts; continuing", track_name);
+            failed_tracks.push(track_name.clone());
+        }
     }
 
-    progress.clear()?;
-    Ok(())
+    if failed_tracks.is_empty() {
+        tracing::info!("Download complete; progress retained for future runs");
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} track(s) failed after retries: {}. Completed tracks were saved and will be skipped next time.",
+            failed_tracks.len(),
+            failed_tracks.join(", ")
+        ))
+    }
+}
+
+fn download_http_track(
+    client: &Client,
+    cookie_header: &str,
+    domain: &str,
+    song_meta: &SongMeta,
+    track_name: &str,
+    level_index: usize,
+    count_in: bool,
+    transpose: i8,
+    download_dir: &std::path::Path,
+) -> Result<(String, PathBuf)> {
+    let trackslevels = song_meta.build_trackslevels_solo(level_index)?;
+    if env::var("KV_HTTP_DEBUG").ok().as_deref() == Some("1") {
+        tracing::info!(
+            "HTTP mix params: track='{}' index={} trackslevels={} pannings={}",
+            track_name,
+            level_index,
+            trackslevels,
+            song_meta.pannings
+        );
+    }
+
+    let params = vec![
+        ("method", "ajax".to_string()),
+        ("famid", song_meta.famid.to_string()),
+        ("precount", if count_in { "1" } else { "0" }.to_string()),
+        ("trackslevels", trackslevels),
+        ("pannings", song_meta.pannings.clone()),
+        ("bkac", song_meta.bkac.clone()),
+        ("s", song_meta.song_id.to_string()),
+        ("prodid", song_meta.prod_id.to_string()),
+        ("pitch", transpose.to_string()),
+    ];
+
+    let basket_url = format!("https://{domain}/basket.php");
+    tracing::info!("Requesting mix build for '{}'", track_name);
+    client
+        .get(&basket_url)
+        .timeout(Duration::from_secs(30))
+        .query(&params)
+        .header("Cookie", cookie_header)
+        .header("X-Requested-With", "XMLHttpRequest")
+        .send()?
+        .error_for_status()?;
+
+    // A fast basket response can leave the previous completed mix visible briefly.
+    // Give the server time to register this track before checking for its file.
+    sleep(Duration::from_secs(1));
+
+    let begin_url = format!(
+        "https://{domain}/my/begin_download.html?id={}&famid={}",
+        song_meta.prod_id, song_meta.famid
+    );
+    tracing::info!("Waiting for '{}' to be prepared", track_name);
+    let file_url = poll_for_file_url(client, cookie_header, &begin_url)?;
+    let filename = file_url
+        .split('/')
+        .last()
+        .ok_or_else(|| anyhow!("Missing filename in download url"))?;
+    let decoded = urlencoding::decode(filename)
+        .map_err(|e| anyhow!("Failed to decode filename: {}", e))?
+        .to_string();
+
+    let file_path = download_dir.join(&decoded);
+    tracing::info!("Downloading '{}'", decoded);
+    download_file(client, &file_url, &file_path)?;
+    Ok((decoded, file_path))
+}
+
+fn files_are_identical(first: &std::path::Path, second: &std::path::Path) -> Result<bool> {
+    use std::io::Read;
+
+    if std::fs::metadata(first)?.len() != std::fs::metadata(second)?.len() {
+        return Ok(false);
+    }
+
+    let mut first = std::fs::File::open(first)?;
+    let mut second = std::fs::File::open(second)?;
+    let mut first_buffer = [0u8; 64 * 1024];
+    let mut second_buffer = [0u8; 64 * 1024];
+    loop {
+        let first_read = first.read(&mut first_buffer)?;
+        let second_read = second.read(&mut second_buffer)?;
+        if first_read != second_read || first_buffer[..first_read] != second_buffer[..second_read] {
+            return Ok(false);
+        }
+        if first_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn write_http_debug_page(download_path: Option<&str>, html: &str) {
+    if env::var("KV_HTTP_DEBUG").ok().as_deref() != Some("1") {
+        return;
+    }
+
+    let debug_path = download_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("kv_http_song.html");
+    if let Err(err) = std::fs::write(&debug_path, html) {
+        tracing::warn!("Failed to write debug html to {}: {}", debug_path.display(), err);
+    } else {
+        tracing::warn!("Wrote debug html to {}", debug_path.display());
+    }
+}
+
+fn is_browser_challenge(html: &str) -> bool {
+    let normalized = html.to_lowercase();
+    normalized.contains("cdn-cgi/challenge-platform")
+        || normalized.contains("cf-challenge")
+        || normalized.contains("cf-turnstile")
+        || normalized.contains("__cf_chl")
+        || normalized.contains("challenge-platform")
+        || normalized.contains("verify you are human")
+        || normalized.contains("just a moment")
+        || normalized.contains("fastly")
+        || normalized.contains("<title>client challenge</title>")
+        || normalized.contains("/_fs-ch-")
+        || normalized.contains("fastly error")
+        || normalized.contains("guru meditation")
+        || normalized.contains("varnish cache server")
+}
+
+fn resolve_browser_challenge(
+    url: &str,
+    domain: &str,
+    download_path: Option<&str>,
+    session_cookie_value: &str,
+) -> Result<String> {
+    let config = Config {
+        domain: domain.to_string(),
+        headless: false,
+        download_path: download_path.map(ToString::to_string),
+        idle_browser_timeout: Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS),
+    };
+    let driver = Driver::new(config);
+    let tab = driver.browser.new_tab()?;
+
+    tab.navigate_to(&format!("https://{domain}"))?
+        .wait_until_navigated()?;
+    tab.set_cookies(vec![headless_chrome::protocol::cdp::Network::CookieParam {
+        name: "karaoke-version".to_string(),
+        value: session_cookie_value.to_string(),
+        url: Some(format!("https://{domain}")),
+        domain: None,
+        secure: None,
+        http_only: None,
+        same_site: None,
+        path: None,
+        expires: None,
+        priority: None,
+        same_party: None,
+        source_scheme: None,
+        source_port: None,
+        partition_key: None,
+    }])?;
+
+    tab.navigate_to(url)?.wait_until_navigated()?;
+    tracing::warn!(
+        "Please complete browser verification and sign in if prompted. Keep the window open until the song mixer appears. Waiting up to {} seconds...",
+        DOWNLOAD_COMPLETION_TIMEOUT_SECS
+    );
+
+    let started = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
+    loop {
+        let html = tab.get_content()?;
+        if SongMeta::parse(&html).is_ok() {
+            let cookies = tab.get_cookies()?;
+            if let Some(session_cookie) = cookies.iter().find(|c| c.name == "karaoke-version") {
+                if session_cookie.value != session_cookie_value
+                    && env::var("KV_SESSION_COOKIE").is_err()
+                {
+                    Keystore::set_auth_cookie(session_cookie)?;
+                }
+            }
+
+            let cookie_header = cookies
+                .iter()
+                .filter(|cookie| domain.ends_with(cookie.domain.trim_start_matches('.')))
+                .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if cookie_header.is_empty() {
+                return Err(anyhow!("Browser verification completed without any site cookies"));
+            }
+
+            tracing::info!("Song mixer loaded; continuing download with browser session");
+            return Ok(cookie_header);
+        }
+
+        if started.elapsed() > Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS) {
+            return Err(anyhow!("Timed out waiting for browser verification challenge to be solved"));
+        }
+
+        if last_log.elapsed() >= Duration::from_secs(10) {
+            tracing::info!("Still waiting for the song mixer to load in the browser...");
+            last_log = std::time::Instant::now();
+        }
+
+        sleep(Duration::from_secs(1));
+    }
 }
 
 fn normalize_track_name(value: &str) -> String {
@@ -678,7 +956,6 @@ fn normalize_track_name(value: &str) -> String {
 struct SongMeta {
     track_names: Vec<String>,
     track_level_indices: Vec<usize>,
-    click_level_index: Option<usize>,
     track_index_map: std::collections::HashMap<String, usize>,
     levels: Vec<u32>,
     pannings: String,
@@ -714,16 +991,13 @@ impl SongMeta {
         let mut track_names = Vec::new();
         let mut track_level_indices = Vec::new();
         let mut track_index_map = std::collections::HashMap::new();
-        let mut click_level_index = None;
-
         for (pos, name) in track_names_raw.iter().enumerate() {
             let level_index = pos + 2; // index 1 is master, index 2 maps to first entry
-            if is_click_track(name) {
-                click_level_index = Some(level_index);
+            let normalized = normalize_metadata_track_name(name);
+            if is_precount_track(&normalized) {
                 continue;
             }
-            let normalized = normalize_track_name(name);
-            track_index_map.insert(normalized.clone(), level_index);
+            track_index_map.insert(normalized.to_lowercase(), level_index);
             track_names.push(normalized);
             track_level_indices.push(level_index);
         }
@@ -731,7 +1005,6 @@ impl SongMeta {
         Ok(Self {
             track_names,
             track_level_indices,
-            click_level_index,
             track_index_map,
             levels,
             pannings,
@@ -745,11 +1018,22 @@ impl SongMeta {
     fn indices_for_tracks(&self, tracks: &[String]) -> Result<std::collections::HashSet<usize>> {
         let mut indices = std::collections::HashSet::new();
         for track in tracks {
+            if is_precount_track(track) {
+                tracing::debug!(
+                    "Ignoring intro count-in entry '{}' because count-in is configured separately",
+                    track
+                );
+                continue;
+            }
             let normalized = normalize_track_name(track);
-            if let Some(level_index) = self.track_index_map.get(&normalized) {
+            if let Some(level_index) = self.track_index_map.get(&normalized.to_lowercase()) {
                 indices.insert(*level_index);
             } else {
-                return Err(anyhow!("Track '{}' not found in song metadata", track));
+                return Err(anyhow!(
+                    "Track '{}' not found in song metadata. Available tracks: {}",
+                    track,
+                    self.track_names.join(", ")
+                ));
             }
         }
         Ok(indices)
@@ -861,12 +1145,26 @@ fn encode_indexed_values(values: &[u32]) -> String {
     parts.join(",")
 }
 
-fn is_click_track(value: &str) -> bool {
-    let normalized = value.to_lowercase();
-    normalized.contains("intro count") || normalized.contains("precount") || normalized.contains("click")
+fn normalize_metadata_track_name(value: &str) -> String {
+    const CAPTION_MARKER: &str = "custom__mixer-track-caption-name";
+    if let Some(marker_index) = value.find(CAPTION_MARKER) {
+        let after_marker = &value[marker_index + CAPTION_MARKER.len()..];
+        if let Some(content_start) = after_marker.find('>') {
+            let content = &after_marker[content_start + 1..];
+            if let Some(content_end) = content.find("</span>") {
+                return normalize_track_name(&content[..content_end].replace("&nbsp;", " "));
+            }
+        }
+    }
+    normalize_track_name(value)
 }
 
-fn poll_for_file_url(client: &Client, cookie: &str, begin_url: &str) -> Result<String> {
+fn is_precount_track(value: &str) -> bool {
+    let normalized = value.to_lowercase();
+    normalized.contains("intro count") || normalized.contains("precount")
+}
+
+fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> Result<String> {
     let timeout = Duration::from_secs(120);
     let start = std::time::Instant::now();
     let produced_url = if begin_url.contains('?') {
@@ -877,7 +1175,8 @@ fn poll_for_file_url(client: &Client, cookie: &str, begin_url: &str) -> Result<S
 
     let resp = client
         .get(begin_url)
-        .header("Cookie", format!("karaoke-version={}", cookie))
+        .timeout(Duration::from_secs(30))
+        .header("Cookie", cookie_header)
         .header("X-Requested-With", "XMLHttpRequest")
         .send()?;
 
@@ -891,7 +1190,14 @@ fn poll_for_file_url(client: &Client, cookie: &str, begin_url: &str) -> Result<S
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
 
+    let mut last_wait_log = std::time::Instant::now();
+
     loop {
+        if last_wait_log.elapsed() >= Duration::from_secs(10) {
+            tracing::info!("Still waiting for server to build download...");
+            last_wait_log = std::time::Instant::now();
+        }
+
         if let Some(wait_url) = &wait_url {
             let wait_full = if wait_url.starts_with("http") {
                 wait_url.clone()
@@ -900,14 +1206,16 @@ fn poll_for_file_url(client: &Client, cookie: &str, begin_url: &str) -> Result<S
             };
             client
                 .get(wait_full)
-                .header("Cookie", format!("karaoke-version={}", cookie))
+                .timeout(Duration::from_secs(30))
+                .header("Cookie", cookie_header)
                 .header("X-Requested-With", "XMLHttpRequest")
                 .send()?;
         }
 
         let resp = client
             .get(&produced_url)
-            .header("Cookie", format!("karaoke-version={}", cookie))
+            .timeout(Duration::from_secs(30))
+            .header("Cookie", cookie_header)
             .header("X-Requested-With", "XMLHttpRequest")
             .send()?;
 
@@ -927,6 +1235,25 @@ fn download_file(client: &Client, url: &str, path: &PathBuf) -> Result<()> {
     let mut file = std::fs::File::create(path)?;
     std::io::copy(&mut resp, &mut file)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod track_type_tests {
+    use super::is_precount_track;
+
+    #[test]
+    fn click_is_a_regular_selectable_track() {
+        assert!(!is_precount_track("Click"));
+        assert!(!is_precount_track("Click Track"));
+        assert!(is_precount_track("Intro Count"));
+        assert!(is_precount_track("Precount"));
+    }
+
+    #[test]
+    fn extracts_click_from_description_containing_precount_control() {
+        let description = "<div class='custom__mixer-track-caption-input'> Intro count</div><span class='custom__mixer-track-caption-name'>&nbsp;&nbsp;Click</span>";
+        assert_eq!(super::normalize_metadata_track_name(description), "Click");
+    }
 }
 
 trait Checkable {

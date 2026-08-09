@@ -17,11 +17,11 @@ impl Driver {
         if let Ok(cookie) = Keystore::get_auth_cookie() {
             tracing::debug!("Cookies before:");
             for c in tab.get_cookies()? {
-                tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");
+                tracing::debug!(cookie_name = c.name, "Browser cookie present");
             }
 
             tracing::info!("Using previous cookie value");
-            tracing::debug!(cookie = serde_json::to_string(&cookie).unwrap());
+            tracing::debug!(cookie_name = cookie.name, "Loaded saved browser cookie");
 
             // only set it if it's an authenticated session with a user id?
             if cookie.value.contains("|u-i:") {
@@ -35,14 +35,14 @@ impl Driver {
 
                 tracing::debug!("Cookies after:");
                 for c in tab.get_cookies()? {
-                    tracing::debug!(cookie = format!("{}: {}", c.name, c.value), "🍪");
+                    tracing::debug!(cookie_name = c.name, "Browser cookie present after reload");
                 }
             }
 
             // continue to check for login link in case this cookie isn't valid anymore
         }
 
-        tracing::info!(user = user, "Logging in user");
+        tracing::info!("Logging in user");
 
         let login_link = tab
             .find_element(".navigation a[href='/my/login.html']")
@@ -50,7 +50,7 @@ impl Driver {
 
         // if we don't have a login link, we're already signed in (from a cookie)
         if login_link.is_none() {
-            tracing::info!(user = user, "Already signed in");
+            tracing::info!("Already signed in");
             return Ok(());
         }
 
@@ -81,10 +81,7 @@ impl Driver {
         let cookies = tab.get_cookies()?;
         if let Some(session_cookie) = cookies.iter().find(|c| c.name == "karaoke-version") {
             tracing::info!("Saving session cookie for next time");
-            tracing::debug!(
-                cookie = format!("{}: {}", session_cookie.name, session_cookie.value),
-                "🍪"
-            );
+            tracing::debug!(cookie_name = session_cookie.name, "Saving browser cookie");
             Keystore::set_auth_cookie(session_cookie)?;
         }
 
