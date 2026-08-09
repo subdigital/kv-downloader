@@ -31,3 +31,6 @@ description = "Build, codesign, and run kvui"
 depends = "build-tui"
 wait_for = "codesign-tui"
 run = 'script -q /dev/null /bin/zsh -lc "cargo run -p kvui"'
+
+[tools]
+rust = "1.97.0"
