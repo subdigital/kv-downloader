@@ -884,7 +884,7 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(Color::Reset)
             };
             ListItem::new(Line::from(Span::styled(
                 format!("{} {}", prefix, item),
@@ -1030,9 +1030,9 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray)
             };
             let text_style = if track.selected {
-                Style::default().fg(Color::White)
+                Style::default().fg(Color::Reset)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(Color::DarkGray)
             };
             let line = Line::from(vec![
                 Span::styled("[", bracket_style),
@@ -1123,7 +1123,7 @@ fn render_download_status(frame: &mut ratatui::Frame, app: &mut App) {
                         .fg(Color::White)
                         .bg(Color::Red)
                         .add_modifier(Modifier::BOLD),
-                    TrackStatus::Pending => Style::default().fg(Color::Gray),
+                    TrackStatus::Pending => Style::default().fg(Color::DarkGray),
                 };
                 let attempt = match track.status {
                     TrackStatus::Downloading => format!(" (attempt {}/3)", track.attempt.max(1)),
@@ -1273,7 +1273,7 @@ fn render_download_done(frame: &mut ratatui::Frame, app: &mut App) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(Color::Reset)
             };
             ListItem::new(Line::from(Span::styled(
                 format!("{} {}", prefix, item),
@@ -2281,7 +2281,7 @@ fn render_loading_overlay(frame: &mut ratatui::Frame, app: &App) {
         Line::from(Span::raw("")),
         Line::from(Span::styled(
             format!("{} {}", spinner, loading.message),
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::Reset),
         )),
     ];
 
