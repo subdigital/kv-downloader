@@ -13,9 +13,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use scraper::{Html, Selector};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -111,6 +111,7 @@ struct App {
     base_key: Option<String>,
     status: String,
     current_song: Option<Song>,
+    download_dir: PathBuf,
     download: Option<DownloadState>,
     logs: Arc<Mutex<LogBuffer>>,
     log_scroll: u16,
@@ -143,6 +144,8 @@ impl App {
             base_key: None,
             status: String::new(),
             current_song: None,
+            download_dir: load_download_dir()
+                .unwrap_or_else(|_| default_download_dir().unwrap_or_else(|| PathBuf::from("."))),
             download: None,
             logs,
             log_scroll: 0,
@@ -169,6 +172,7 @@ impl App {
                 "Resync Songs List".to_string(),
                 "Reset Song Progress".to_string(),
                 "Reset All Download Progress".to_string(),
+                "Set Download Folder".to_string(),
                 "Logout".to_string(),
                 "Quit".to_string(),
             ]
@@ -178,6 +182,7 @@ impl App {
                 "Resync Songs List".to_string(),
                 "Reset Song Progress".to_string(),
                 "Reset All Download Progress".to_string(),
+                "Set Download Folder".to_string(),
                 "Login".to_string(),
                 "Quit".to_string(),
             ]
@@ -249,6 +254,7 @@ fn configure_demo_screen(app: &mut App, screen: DemoScreen) {
         "Resync Songs List".to_string(),
         "Reset Song Progress".to_string(),
         "Reset All Download Progress".to_string(),
+        "Set Download Folder".to_string(),
         "Logout".to_string(),
         "Quit".to_string(),
     ];
@@ -552,6 +558,32 @@ fn handle_menu_keys(
                         app.status = "No saved song progress to reset".to_string();
                     } else {
                         set_song_list(app, songs);
+                    }
+                }
+                "Set Download Folder" => {
+                    restore_terminal(terminal)?;
+                    let selection = prompt_download_folder(&app.download_dir);
+                    *terminal = setup_terminal()?;
+                    match selection {
+                        Ok(Some(path)) => match save_download_dir(&path) {
+                            Ok(()) => {
+                                app.download_dir = path;
+                                app.status = format!(
+                                    "Download folder set to {}",
+                                    app.download_dir.display()
+                                );
+                            }
+                            Err(err) => {
+                                app.status = format!("Could not save download folder: {err}");
+                            }
+                        },
+                        Ok(None) => {
+                            app.status = format!(
+                                "Download folder unchanged: {}",
+                                app.download_dir.display()
+                            );
+                        }
+                        Err(err) => app.status = format!("Invalid download folder: {err}"),
                     }
                 }
                 "Reset All Download Progress" => {
@@ -886,10 +918,21 @@ fn render_menu(frame: &mut ratatui::Frame, app: &mut App) {
             } else {
                 Style::default().fg(Color::Reset)
             };
-            ListItem::new(Line::from(Span::styled(
-                format!("{} {}", prefix, item),
-                style,
-            )))
+            if item == "Set Download Folder" {
+                let current = abbreviate_path(&app.download_dir, 20);
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{} {}", prefix, item), style),
+                    Span::styled(
+                        format!("  (current: {current})"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            } else {
+                ListItem::new(Line::from(Span::styled(
+                    format!("{} {}", prefix, item),
+                    style,
+                )))
+            }
         })
         .collect();
 
@@ -984,7 +1027,7 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(5),
             Constraint::Length(5),
             Constraint::Length(3),
@@ -1007,6 +1050,13 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
             Span::raw(key_display),
         ]),
         Line::from("Toggle intro click with 'i'. Adjust key with +/- or arrows."),
+        Line::from(vec![
+            Span::styled(
+                "Download folder: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.download_dir.display().to_string()),
+        ]),
     ];
 
     let header = Paragraph::new(Text::from(controls))
@@ -1071,6 +1121,7 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
         layout[2],
         app.detail_focus == DetailFocus::Download,
         &app.status,
+        &app.download_dir,
     );
 
     let help = Paragraph::new("Tab: switch pane | Space: toggle | i: intro | +/-: key | ESC: menu")
@@ -1298,6 +1349,7 @@ fn render_download_block(
     area: Rect,
     focused: bool,
     status: &str,
+    download_dir: &Path,
 ) {
     let mut title = "Download".to_string();
     if focused {
@@ -1312,10 +1364,17 @@ fn render_download_block(
         } else {
             Style::default().fg(Color::DarkGray)
         });
-    let mut lines = vec![Line::from(Span::styled(
-        "[ Download ]",
-        Style::default().add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
-    ))];
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "[ Download ]",
+            Style::default().add_modifier(if focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+        )),
+        Line::from(format!("Save to: {}", download_dir.display())),
+    ];
     if !status.trim().is_empty() {
         lines.push(Line::from(Span::raw(status)));
     }
@@ -1350,6 +1409,7 @@ fn start_download(
     count_in: bool,
     transpose: i8,
     selected_tracks: Vec<String>,
+    download_dir: &Path,
 ) -> Result<()> {
     let domain = extract_domain_from_url(song_url)
         .ok_or_else(|| anyhow!("Missing domain from url"))?;
@@ -1364,7 +1424,12 @@ fn start_download(
         force_restart: false,
     };
     tracing::info!("Using HTTP downloader");
-    tasks::download_song::download_song_http(song_url, download_options, None, &domain)?;
+    tasks::download_song::download_song_http(
+        song_url,
+        download_options,
+        Some(download_dir.to_string_lossy().into_owned()),
+        &domain,
+    )?;
     Ok(())
 }
 
@@ -2391,8 +2456,15 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                     } => {
                         app.log_scroll = 0;
                         app.log_follow = true;
-                        let download_dir = default_download_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let download_dir = app.download_dir.clone();
+                        if !download_dir.is_dir() {
+                            app.status = format!(
+                                "Download folder is unavailable: {}. Choose a new folder from the main menu.",
+                                download_dir.display()
+                            );
+                            app.screen = Screen::SongDetail;
+                            return Ok(false);
+                        }
                         let download_tracks = selected_tracks
                             .iter()
                             .map(|name| TrackStatusItem {
@@ -2403,9 +2475,16 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                             .collect::<Vec<_>>();
                         let song_url = song.url.clone();
                         let logs = app.logs.clone();
+                        let worker_download_dir = download_dir.clone();
                         let handle = std::thread::spawn(move || {
                             let _guard = LogScope::new(logs);
-                            start_download(&song_url, intro_click, key_shift, selected_tracks)
+                            start_download(
+                                &song_url,
+                                intro_click,
+                                key_shift,
+                                selected_tracks,
+                                &worker_download_dir,
+                            )
                         });
                         app.download = Some(DownloadState {
                             song,
@@ -2522,10 +2601,108 @@ fn normalize_key(value: &str) -> (bool, &str) {
     (use_flats, normalized)
 }
 
-fn default_download_dir() -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
-    let download_dir = home.join("Downloads");
-    Some(download_dir)
+fn abbreviate_path(path: &Path, maximum_characters: usize) -> String {
+    let value = path.display().to_string();
+    let character_count = value.chars().count();
+    if character_count <= maximum_characters {
+        return value;
+    }
+    if maximum_characters <= 3 {
+        return ".".repeat(maximum_characters);
+    }
+
+    let suffix = value
+        .chars()
+        .rev()
+        .take(maximum_characters - 3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("...{suffix}")
+}
+
+fn prompt_download_folder(current: &Path) -> Result<Option<PathBuf>> {
+    println!("Current download folder: {}", current.display());
+    let value = kv_core::prompt::prompt(
+        "New download folder (leave blank to keep the current folder): ",
+        false,
+    )?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let path = expand_home_directory(value)?;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let path = path
+        .canonicalize()
+        .map_err(|err| anyhow!("could not open {}: {err}", path.display()))?;
+    if !path.is_dir() {
+        return Err(anyhow!("{} is not a directory", path.display()));
+    }
+    if path.to_str().is_none() {
+        return Err(anyhow!("the selected path is not valid UTF-8"));
+    }
+
+    Ok(Some(path))
+}
+
+fn expand_home_directory(value: &str) -> Result<PathBuf> {
+    if value == "~" {
+        return dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"));
+    }
+    if let Some(relative_path) = value.strip_prefix("~/") {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
+        return Ok(home.join(relative_path));
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn settings_path() -> Result<PathBuf> {
+    let config_dir =
+        dirs::config_dir().ok_or_else(|| anyhow!("could not determine config directory"))?;
+    Ok(config_dir.join("kv-downloader").join("kvui-settings"))
+}
+
+fn load_download_dir() -> Result<PathBuf> {
+    load_download_dir_from(&settings_path()?)
+}
+
+fn load_download_dir_from(path: &Path) -> Result<PathBuf> {
+    match fs::read_to_string(path) {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(anyhow!("download folder setting is empty"));
+            }
+            Ok(PathBuf::from(value))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => default_download_dir()
+            .ok_or_else(|| anyhow!("could not determine default download folder")),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn save_download_dir(download_dir: &Path) -> Result<()> {
+    save_download_dir_to(&settings_path()?, download_dir)
+}
+
+fn save_download_dir_to(settings_path: &Path, download_dir: &Path) -> Result<()> {
+    let parent = settings_path
+        .parent()
+        .ok_or_else(|| anyhow!("settings path has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    fs::write(settings_path, download_dir.to_string_lossy().as_bytes())?;
+    Ok(())
+}
+
+fn default_download_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join("Downloads"))
 }
 
 fn open_in_file_explorer(path: &std::path::Path) -> Result<()> {
@@ -2562,7 +2739,13 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod song_catalog_tests {
-    use super::{find_next_songs_page, parse_purchase_date, Html};
+    use super::{
+        abbreviate_path, find_next_songs_page, load_download_dir_from, parse_purchase_date,
+        save_download_dir_to, Html,
+    };
+    use std::fs;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_purchase_date_for_local_sorting() {
@@ -2583,5 +2766,35 @@ mod song_catalog_tests {
         assert!(next.contains("page=2"));
         assert!(next.contains("orderField=add_date"));
         assert!(next.contains("orderSort=desc"));
+    }
+
+    #[test]
+    fn abbreviates_long_download_folder_from_the_start() {
+        let abbreviated = abbreviate_path(Path::new("/a/very/long/path/to/downloads"), 20);
+
+        assert_eq!(abbreviated.chars().count(), 20);
+        assert!(abbreviated.starts_with("..."));
+        assert!(abbreviated.ends_with("to/downloads"));
+        assert_eq!(abbreviate_path(Path::new("~/Downloads"), 20), "~/Downloads");
+    }
+
+    #[test]
+    fn saves_and_loads_download_folder() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("kvui-settings-{}-{unique}", std::process::id()));
+        let settings_path = directory.join("nested").join("kvui-settings");
+        let download_dir = directory.join("downloads");
+
+        save_download_dir_to(&settings_path, &download_dir).unwrap();
+
+        assert_eq!(
+            load_download_dir_from(&settings_path).unwrap(),
+            download_dir
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

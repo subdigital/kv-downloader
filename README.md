@@ -138,6 +138,8 @@ Useful song-list controls:
 
 On the track screen, use `Space` to toggle a track, `i` to toggle the intro count, and `+`/`-` or Left/Right to transpose.
 
+Choose **Set Download Folder** from the main menu to enter an existing folder. `~` and relative paths are supported. `kvui` saves the selection in the platform-specific configuration directory and restores it the next time it launches; until changed, downloads go to `~/Downloads`.
+
 ### Download status and completion
 
 `kvui` displays each track's state, the current retry attempt, live diagnostic logs, and a final summary. Completed tracks remain available even when another track fails.
