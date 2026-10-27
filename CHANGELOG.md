@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5
+
+- Reuse a persistent Chrome profile so Fastly's bot-challenge clearance survives between runs
+- Launch Chrome without automation flags
+- Detect Fastly's challenge page by its title only, so normal pages (which load Fastly's security script) are not mistaken for it
+- HTTP downloads reuse the verified browser's cookies and User-Agent
+- Refresh the browser session and retry when a track is challenged mid-song
+- Pace requests with jitter and stop a song after repeated consecutive failures
+
 ## 0.4.1
 
 - Adds a way to pass additional flags to the headless chrome binary. Separate these arguments from kv_downloader args with a single `--`.

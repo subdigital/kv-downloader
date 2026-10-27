@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::env;
 use headless_chrome::protocol::cdp::Network::{Cookie, CookieParam};
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,13 @@ impl Keystore {
         Ok(())
     }
 
+    pub fn clear_auth_cookie() -> Result<()> {
+        if let Ok(entry) = Entry::new(KEYSTORE_SERVICE, KV_SESSION_COOKIE_KEY) {
+            let _ = entry.delete_credential().ok();
+        }
+        Ok(())
+    }
+
     pub fn get_credentials() -> Result<Credentials> {
         let entry = Entry::new(KEYSTORE_SERVICE, KV_CREDENTIALS_KEY)?;
         let encoded_data = entry.get_secret()?;
@@ -41,6 +49,25 @@ impl Keystore {
     }
 
     pub fn get_auth_cookie() -> Result<CookieParam> {
+        if let Ok(value) = env::var("KV_SESSION_COOKIE") {
+            return Ok(CookieParam {
+                name: "karaoke-version".to_string(),
+                value,
+                url: Some("https://www.karaoke-version.com".to_string()),
+                domain: None,
+                secure: None,
+                http_only: None,
+                same_site: None,
+                path: None,
+                expires: None,
+                priority: None,
+                same_party: None,
+                source_scheme: None,
+                source_port: None,
+                partition_key: None,
+            });
+        }
+
         let secret = Entry::new(KEYSTORE_SERVICE, KV_SESSION_COOKIE_KEY)?.get_secret()?;
         let cookie: Cookie = serde_json::from_slice(&secret).expect("Unable to deserialize cookie");
 
@@ -65,7 +92,21 @@ impl Keystore {
         Ok(cookie_param)
     }
 
+    pub fn get_auth_cookie_value() -> Result<String> {
+        if let Ok(value) = env::var("KV_SESSION_COOKIE") {
+            return Ok(value);
+        }
+
+        let secret = Entry::new(KEYSTORE_SERVICE, KV_SESSION_COOKIE_KEY)?.get_secret()?;
+        let cookie: Cookie = serde_json::from_slice(&secret).expect("Unable to deserialize cookie");
+        Ok(cookie.value)
+    }
+
     pub fn set_auth_cookie(cookie: &Cookie) -> Result<()> {
+        if env::var("KV_SESSION_COOKIE").is_ok() {
+            return Ok(());
+        }
+
         let value = serde_json::to_vec_pretty(&cookie).expect("Unable to serialize cookie");
         Entry::new(KEYSTORE_SERVICE, KV_SESSION_COOKIE_KEY)?.set_secret(&value)?;
         Ok(())

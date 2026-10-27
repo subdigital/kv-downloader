@@ -40,8 +40,15 @@ jobs:
         with:
           packages: libdbus-glib-1-dev
         if: matrix.os == 'ubuntu-latest'
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - name: Upload kv-downloader
+        uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: kv_downloader
+          target: ${{ matrix.target }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload kvui
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: kvui
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
