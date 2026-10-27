@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5
+## 0.5.0
 
 - Reuse a persistent Chrome profile so Fastly's bot-challenge clearance survives between runs
 - Launch Chrome without automation flags
