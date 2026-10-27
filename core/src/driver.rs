@@ -3,6 +3,7 @@ use headless_chrome::protocol::cdp::Network::CookieParam;
 use headless_chrome::{types::Bounds, Browser, LaunchOptions, Tab};
 use std::error::Error;
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const DEFAULT_BROWSER_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -12,6 +13,14 @@ pub struct Config {
     pub headless: bool,
     pub download_path: Option<String>,
     pub idle_browser_timeout: Duration,
+    /// Chrome profile to reuse between runs. Keeps the site's bot-challenge
+    /// clearance and sign-in. `None` uses a throwaway profile.
+    pub profile_dir: Option<PathBuf>,
+}
+
+/// Where the persistent Chrome profile lives.
+pub fn default_profile_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("kv-downloader").join("chrome-profile"))
 }
 
 impl Default for Config {
@@ -21,6 +30,7 @@ impl Default for Config {
             headless: false,
             download_path: None,
             idle_browser_timeout: DEFAULT_BROWSER_IDLE_TIMEOUT,
+            profile_dir: None,
         }
     }
 }
@@ -37,11 +47,19 @@ impl Driver {
             headless: config.headless,
             window_size: Some((1440, 1200)),
             enable_logging: true,
+            user_data_dir: config.profile_dir.clone(),
+            // headless_chrome defaults this to true, which makes Chrome label
+            // every page "Not Secure" and weakens TLS checks for no benefit.
+            ignore_certificate_errors: false,
             // Avoid Chromium's own macOS Keychain prompts for temporary profiles.
             args: vec![
                 OsStr::new("--password-store=basic"),
                 OsStr::new("--use-mock-keychain"),
+                OsStr::new("--disable-blink-features=AutomationControlled"),
             ],
+            // Don't present as an automated browser; the site's bot check
+            // keeps re-challenging sessions that do.
+            ignore_default_args: vec![OsStr::new("--enable-automation")],
             // Keep the DevTools websocket alive during long downloads.
             idle_browser_timeout: config.idle_browser_timeout,
             ..Default::default()
@@ -81,6 +99,16 @@ impl Driver {
         tab.call_method(download_behavior_method)?;
 
         Ok(())
+    }
+
+    /// Asks Chrome to shut down cleanly so the profile (cookies, challenge
+    /// clearance) is flushed to disk. Dropping the driver kills the process.
+    pub fn close(&self, tab: &Tab) {
+        let close = headless_chrome::protocol::cdp::Browser::Close(None);
+        if let Err(err) = tab.call_method(close) {
+            tracing::debug!("Failed to close browser cleanly: {}", err);
+        }
+        std::thread::sleep(Duration::from_secs(2));
     }
 
     pub fn minimize_tab(&self, tab: &Tab) {

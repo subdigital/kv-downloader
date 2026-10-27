@@ -1396,6 +1396,7 @@ fn login_flow() -> Result<()> {
         headless: false,
         download_path: None,
         idle_browser_timeout: Duration::from_secs(300),
+        profile_dir: driver::default_profile_dir(),
     };
     tracing::info!("Launching Chromium for login (headless: false)");
     let driver = driver::Driver::new(config);
@@ -1620,18 +1621,7 @@ fn parse_purchase_date(value: &str) -> Option<i64> {
 }
 
 fn is_browser_verification_page(html: &str) -> bool {
-    let normalized = html.to_lowercase();
-    normalized.contains("cdn-cgi/challenge-platform")
-        || normalized.contains("cf-challenge")
-        || normalized.contains("cf-turnstile")
-        || normalized.contains("__cf_chl")
-        || normalized.contains("verify you are human")
-        || normalized.contains("just a moment")
-        || normalized.contains("fastly")
-        || normalized.contains("<title>client challenge</title>")
-        || normalized.contains("/_fs-ch-")
-        || normalized.contains("guru meditation")
-        || normalized.contains("varnish cache server")
+    kv_core::challenge::is_challenge_html(html)
 }
 
 fn fetch_page_in_visible_browser(
@@ -1644,6 +1634,7 @@ fn fetch_page_in_visible_browser(
         headless: false,
         download_path: None,
         idle_browser_timeout: Duration::from_secs(300),
+        profile_dir: driver::default_profile_dir(),
     };
     let driver = driver::Driver::new(config);
     let tab = driver.browser.new_tab()?;

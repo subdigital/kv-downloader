@@ -1,4 +1,5 @@
-use crate::driver::{Config, Driver};
+use crate::challenge::{is_challenge_html, jitter, notify_user, ChallengeError};
+use crate::driver::{default_profile_dir, Config, Driver};
 use crate::download_progress::DownloadProgress;
 use crate::keystore::Keystore;
 
@@ -10,7 +11,8 @@ use headless_chrome::protocol::cdp::Page::StartScreencastFormatOption;
 use headless_chrome::{Element, Tab};
 use headless_chrome::browser::tab::RequestPausedDecision;
 use headless_chrome::protocol::cdp::Fetch::events::RequestPausedEvent;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
+use reqwest::header::{HeaderMap, HeaderValue, REFERER};
 use std::fmt::Display;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -21,6 +23,19 @@ use std::{env, error::Error, thread::sleep, time::Duration, time::SystemTime};
 
 /// Maximum time to wait for a download to complete (in seconds)
 const DOWNLOAD_COMPLETION_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+/// How many times one song may re-verify in the browser before giving up.
+const MAX_CHALLENGE_REFRESHES: u32 = 2;
+
+/// Stop a song after this many tracks in a row fail; the cause is unlikely to
+/// clear up by hammering the site.
+const MAX_CONSECUTIVE_TRACK_FAILURES: u32 = 2;
+
+/// Pause between tracks so requests aren't fired back to back.
+const TRACK_PACING: Duration = Duration::from_secs(3);
+
+/// Used until a browser has told us what it really looks like.
+const FALLBACK_USER_AGENT: &str = "kv-downloader-http";
 
 #[derive(Default)]
 pub struct DownloadOptions {
@@ -568,37 +583,24 @@ pub fn download_song_http(
 
     let cookie = Keystore::get_auth_cookie_value()
         .map_err(|_| anyhow!("Missing session cookie. Run `kv-downloader auth` first."))?;
-    let mut cookie_header = format!("karaoke-version={}", cookie);
 
-    let client = Client::builder()
-        .user_agent("kv-downloader-http")
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS))
-        .build()?;
+    let mut session = HttpSession::new(
+        format!("karaoke-version={}", cookie),
+        FALLBACK_USER_AGENT,
+        url,
+    )?;
 
-    let mut song_page = client
-        .get(url)
-        .timeout(Duration::from_secs(30))
-        .header("Cookie", &cookie_header)
-        .send()?
-        .text()?;
-
+    let mut song_page = session.fetch_page(url)?;
     write_http_debug_page(download_path.as_deref(), &song_page);
 
     let mut tried_browser_verification = false;
-    if is_browser_challenge(&song_page) {
+    if is_challenge_html(&song_page) {
         tracing::warn!("Browser verification challenge detected. Opening a browser window to let you solve it.");
-        cookie_header =
-            resolve_browser_challenge(url, domain, download_path.as_deref(), &cookie)?;
+        session = refresh_session(url, domain, download_path.as_deref(), &cookie)?;
         tried_browser_verification = true;
-        song_page = client
-            .get(url)
-            .timeout(Duration::from_secs(30))
-            .header("Cookie", &cookie_header)
-            .send()?
-            .text()?;
+        song_page = session.fetch_page(url)?;
 
-        if is_browser_challenge(&song_page) {
+        if is_challenge_html(&song_page) {
             return Err(anyhow!(
                 "Browser verification challenge is still active after browser verification"
             ));
@@ -614,14 +616,8 @@ pub fn download_song_http(
                 "Song page did not contain expected mixer metadata ({}). Opening a browser window to refresh verification and session state.",
                 err
             );
-            cookie_header =
-                resolve_browser_challenge(url, domain, download_path.as_deref(), &cookie)?;
-            song_page = client
-                .get(url)
-                .timeout(Duration::from_secs(30))
-                .header("Cookie", &cookie_header)
-                .send()?
-                .text()?;
+            session = refresh_session(url, domain, download_path.as_deref(), &cookie)?;
+            song_page = session.fetch_page(url)?;
             SongMeta::parse(&song_page).map_err(|retry_err| {
                 write_http_debug_page(download_path.as_deref(), &song_page);
                 anyhow!(
@@ -648,6 +644,9 @@ pub fn download_song_http(
 
     let mut failed_tracks = Vec::new();
     let mut downloaded_files: Vec<PathBuf> = Vec::new();
+    let mut challenge_refreshes = 0;
+    let mut consecutive_failures = 0;
+    let mut requested_any = false;
 
     for (index, track_name) in song_meta.track_names.iter().enumerate() {
         let level_index = song_meta.track_level_indices[index];
@@ -665,22 +664,46 @@ pub fn download_song_http(
             continue;
         }
 
+        if requested_any {
+            sleep(jitter(TRACK_PACING));
+        }
+        requested_any = true;
+
         tracing::info!("Processing track {} '{}'", level_index, track_name);
 
         let mut completed = false;
         for attempt in 1..=3 {
             tracing::info!("Attempt {}/3 for '{}'", attempt, track_name);
-            match download_http_track(
-                &client,
-                &cookie_header,
-                domain,
-                &song_meta,
-                track_name,
-                level_index,
-                options.count_in,
-                options.transpose,
-                &download_dir,
-            ) {
+            let result = loop {
+                match download_http_track(
+                    &session.client,
+                    &session.cookie_header,
+                    domain,
+                    &song_meta,
+                    track_name,
+                    level_index,
+                    options.count_in,
+                    options.transpose,
+                    &download_dir,
+                ) {
+                    Err(err) if err.downcast_ref::<ChallengeError>().is_some() => {
+                        challenge_refreshes += 1;
+                        if challenge_refreshes > MAX_CHALLENGE_REFRESHES {
+                            return Err(anyhow!(
+                                "The site keeps asking for browser verification. Completed tracks were saved; try again later or use --browser."
+                            ));
+                        }
+                        tracing::warn!(
+                            "Challenged while downloading '{}'; refreshing the browser session",
+                            track_name
+                        );
+                        session =
+                            refresh_session(url, domain, download_path.as_deref(), &cookie)?;
+                    }
+                    other => break other,
+                }
+            };
+            match result {
                 Ok((decoded, file_path)) => {
                     if let Some(previous) = downloaded_files
                         .iter()
@@ -693,8 +716,7 @@ pub fn download_song_http(
                         );
                         let _ = std::fs::remove_file(&file_path);
                         if attempt < 3 {
-                            tracing::info!("Retrying '{}' in 5 seconds", track_name);
-                            sleep(Duration::from_secs(5));
+                            retry_backoff(track_name, attempt);
                         }
                         continue;
                     }
@@ -713,16 +735,25 @@ pub fn download_song_http(
                         err
                     );
                     if attempt < 3 {
-                        tracing::info!("Retrying '{}' in 5 seconds", track_name);
-                        sleep(Duration::from_secs(5));
+                        retry_backoff(track_name, attempt);
                     }
                 }
             }
         }
 
-        if !completed {
-            tracing::error!("Giving up on '{}' after 3 attempts; continuing", track_name);
+        if completed {
+            consecutive_failures = 0;
+        } else {
+            tracing::error!("Giving up on '{}' after 3 attempts", track_name);
             failed_tracks.push(track_name.clone());
+            consecutive_failures += 1;
+            if consecutive_failures >= MAX_CONSECUTIVE_TRACK_FAILURES {
+                tracing::error!(
+                    "{} tracks in a row failed; stopping this song. Re-run later to resume.",
+                    consecutive_failures
+                );
+                break;
+            }
         }
     }
 
@@ -774,7 +805,7 @@ fn download_http_track(
 
     let basket_url = format!("https://{domain}/basket.php");
     tracing::info!("Requesting mix build for '{}'", track_name);
-    client
+    let basket = client
         .get(&basket_url)
         .timeout(Duration::from_secs(30))
         .query(&params)
@@ -782,6 +813,7 @@ fn download_http_track(
         .header("X-Requested-With", "XMLHttpRequest")
         .send()?
         .error_for_status()?;
+    checked_text(basket)?;
 
     // A fast basket response can leave the previous completed mix visible briefly.
     // Give the server time to register this track before checking for its file.
@@ -846,56 +878,92 @@ fn write_http_debug_page(download_path: Option<&str>, html: &str) {
     }
 }
 
-fn is_browser_challenge(html: &str) -> bool {
-    let normalized = html.to_lowercase();
-    normalized.contains("cdn-cgi/challenge-platform")
-        || normalized.contains("cf-challenge")
-        || normalized.contains("cf-turnstile")
-        || normalized.contains("__cf_chl")
-        || normalized.contains("challenge-platform")
-        || normalized.contains("verify you are human")
-        || normalized.contains("just a moment")
-        || normalized.contains("fastly")
-        || normalized.contains("<title>client challenge</title>")
-        || normalized.contains("/_fs-ch-")
-        || normalized.contains("fastly error")
-        || normalized.contains("guru meditation")
-        || normalized.contains("varnish cache server")
+/// Reads a response body, failing with `ChallengeError` if it's the bot challenge.
+fn checked_text(resp: Response) -> Result<String> {
+    let body = resp.text()?;
+    if is_challenge_html(&body) {
+        return Err(anyhow!(ChallengeError));
+    }
+    Ok(body)
 }
 
+fn retry_backoff(track_name: &str, attempt: u32) {
+    let delay = jitter(Duration::from_secs(5 * 2u64.pow(attempt - 1)));
+    tracing::info!("Retrying '{}' in {} seconds", track_name, delay.as_secs());
+    sleep(delay);
+}
+
+/// An HTTP client that presents itself the way the browser that passed the
+/// site's verification did: same cookies, same User-Agent, same referer.
+struct HttpSession {
+    client: Client,
+    cookie_header: String,
+}
+
+impl HttpSession {
+    fn new(cookie_header: String, user_agent: &str, referer: &str) -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        headers.insert(REFERER, HeaderValue::from_str(referer)?);
+        let client = Client::builder()
+            .user_agent(user_agent)
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS))
+            .build()?;
+        Ok(HttpSession {
+            client,
+            cookie_header,
+        })
+    }
+
+    fn fetch_page(&self, url: &str) -> Result<String> {
+        Ok(self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(30))
+            .header("Cookie", &self.cookie_header)
+            .send()?
+            .text()?)
+    }
+}
+
+struct BrowserContext {
+    cookie_header: String,
+    user_agent: String,
+}
+
+fn refresh_session(
+    url: &str,
+    domain: &str,
+    download_path: Option<&str>,
+    session_cookie_value: &str,
+) -> Result<HttpSession> {
+    let browser = resolve_browser_challenge(url, domain, download_path, session_cookie_value)?;
+    HttpSession::new(browser.cookie_header, &browser.user_agent, url)
+}
+
+/// Opens a visible browser on the persistent profile and waits for the song
+/// page to load, which includes the user passing any verification. Returns
+/// the cookies and User-Agent for HTTP requests to reuse.
 fn resolve_browser_challenge(
     url: &str,
     domain: &str,
     download_path: Option<&str>,
     session_cookie_value: &str,
-) -> Result<String> {
+) -> Result<BrowserContext> {
     let config = Config {
         domain: domain.to_string(),
         headless: false,
         download_path: download_path.map(ToString::to_string),
         idle_browser_timeout: Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS),
+        profile_dir: default_profile_dir(),
     };
     let driver = Driver::new(config);
     let tab = driver.browser.new_tab()?;
 
     tab.navigate_to(&format!("https://{domain}"))?
         .wait_until_navigated()?;
-    tab.set_cookies(vec![headless_chrome::protocol::cdp::Network::CookieParam {
-        name: "karaoke-version".to_string(),
-        value: session_cookie_value.to_string(),
-        url: Some(format!("https://{domain}")),
-        domain: None,
-        secure: None,
-        http_only: None,
-        same_site: None,
-        path: None,
-        expires: None,
-        priority: None,
-        same_party: None,
-        source_scheme: None,
-        source_port: None,
-        partition_key: None,
-    }])?;
+    driver.set_session_cookie(&tab, session_cookie_value)?;
 
     tab.navigate_to(url)?.wait_until_navigated()?;
     tracing::warn!(
@@ -905,6 +973,7 @@ fn resolve_browser_challenge(
 
     let started = std::time::Instant::now();
     let mut last_log = std::time::Instant::now();
+    let mut notified = false;
     loop {
         let html = tab.get_content()?;
         if SongMeta::parse(&html).is_ok() {
@@ -927,8 +996,23 @@ fn resolve_browser_challenge(
                 return Err(anyhow!("Browser verification completed without any site cookies"));
             }
 
+            let user_agent = tab
+                .evaluate("navigator.userAgent", false)?
+                .value
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .ok_or_else(|| anyhow!("Unable to read the browser's User-Agent"))?;
+
             tracing::info!("Song mixer loaded; continuing download with browser session");
-            return Ok(cookie_header);
+            driver.close(&tab);
+            return Ok(BrowserContext {
+                cookie_header,
+                user_agent,
+            });
+        }
+
+        if !notified && is_challenge_html(&html) {
+            notify_user("Verification needed: complete the check in the browser window.");
+            notified = true;
         }
 
         if started.elapsed() > Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS) {
@@ -1189,6 +1273,7 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
         .get("x-mutli-building")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_string());
+    checked_text(resp)?;
 
     let mut last_wait_log = std::time::Instant::now();
 
@@ -1204,12 +1289,13 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
             } else {
                 format!("https://www.karaoke-version.com{}", wait_url)
             };
-            client
+            let wait_resp = client
                 .get(wait_full)
                 .timeout(Duration::from_secs(30))
                 .header("Cookie", cookie_header)
                 .header("X-Requested-With", "XMLHttpRequest")
                 .send()?;
+            checked_text(wait_resp)?;
         }
 
         let resp = client
@@ -1222,6 +1308,7 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
         if let Some(file_href) = resp.headers().get("x-file-href") {
             return Ok(file_href.to_str()?.to_string());
         }
+        checked_text(resp)?;
 
         if start.elapsed() > timeout {
             return Err(anyhow!("Timed out waiting for server to build download"));
@@ -1232,6 +1319,15 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
 
 fn download_file(client: &Client, url: &str, path: &PathBuf) -> Result<()> {
     let mut resp = client.get(url).send()?;
+    let is_html = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    if is_html {
+        checked_text(resp)?;
+        return Err(anyhow!("Expected an MP3 but the server returned a web page"));
+    }
     let mut file = std::fs::File::create(path)?;
     std::io::copy(&mut resp, &mut file)?;
     Ok(())

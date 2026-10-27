@@ -1,3 +1,4 @@
+pub mod challenge;
 pub mod commands;
 pub mod download_progress;
 pub mod driver;

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Reuse a persistent Chrome profile so Fastly's bot-challenge clearance survives between runs
+- Launch Chrome without automation flags
+- Detect Fastly's challenge page by its title only, so normal pages (which load Fastly's security script) are not mistaken for it
+- HTTP downloads reuse the verified browser's cookies and User-Agent
+- Refresh the browser session and retry when a track is challenged mid-song
+- Pace requests with jitter and stop a song after repeated consecutive failures
+
 ## 0.4.0
 
 - Add a metadata file to track progress of downloads, allow a second run to continue where you left off

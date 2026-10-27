@@ -174,7 +174,12 @@ The TUI includes actions to reset progress for a selected song or delete all sav
 
 ### Browser challenge fallback
 
-Normal downloads use direct HTTP requests. If Fastly or Cloudflare returns a browser-verification challenge, `kvui` can open a visible Chromium session to complete the request. The browser uses settings that avoid repeated macOS Keychain prompts.
+Normal downloads use direct HTTP requests. If Fastly returns its "Client Challenge" page, a visible Chromium window opens so you can complete the check. You get a terminal bell (and a notification on macOS) when it needs you.
+
+- The browser uses a persistent profile in your config directory (`kv-downloader/chrome-profile`), so the clearance carries over between runs and you are usually only prompted once in a while.
+- After the browser passes verification, HTTP requests reuse its cookies and User-Agent.
+- If a track is challenged mid-download, the browser session is refreshed and the track retried. After repeated challenges the run stops; completed tracks are kept, so re-running resumes. `kv-downloader download --browser` is the slower fallback.
+- Requests are paced with jittered delays and exponential retry backoff. A song stops after two tracks in a row fail.
 
 ### Diagnostics
 

@@ -88,6 +88,7 @@ impl Download {
             headless: args.headless,
             download_path: args.download_path,
             idle_browser_timeout: Duration::from_secs(args.browser_idle_timeout_secs),
+            profile_dir: driver::default_profile_dir(),
         };
         let driver = driver::Driver::new(config);
 
