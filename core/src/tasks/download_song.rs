@@ -73,7 +73,7 @@ impl Driver {
         self.progress.log_resume_status()?;
 
         let tab = self.browser.new_tab()?;
-        self.minimize_tab(&tab);
+        // self.minimize_tab(&tab); // Visibility test
         tab.set_default_timeout(Duration::from_secs(30));
 
         self.enable_network_capture(&tab)?;
