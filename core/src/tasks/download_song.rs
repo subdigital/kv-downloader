@@ -233,8 +233,39 @@ impl Driver {
 
         solo_btn.scroll_into_view()?;
         sleep(Duration::from_millis(500));
-        solo_btn.click()?;
+
+        // Solo is a toggle: leave an already-active button alone.
+        let was_active = solo_btn
+            .get_attribute_value("class")?
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|class| class == "is-active");
+
+        if !was_active {
+            solo_btn.click()?;
+        }
+
         sleep(Duration::from_millis(500));
+
+        // Verify exactly one track is soloed.
+        let is_active = solo_btn
+            .get_attribute_value("class")?
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|class| class == "is-active");
+
+        let active_count = tab
+            .find_elements(".track__controls.track__solo.is-active")?
+            .len();
+
+        if !is_active || active_count != 1 {
+            return Err(anyhow!(
+                "Incorrect Solo state for '{}': selected={}, active solo tracks={}",
+                track_name,
+                is_active,
+                active_count
+            ));
+        }
 
         tracing::info!("- starting download...");
         download_button.scroll_into_view()?;
