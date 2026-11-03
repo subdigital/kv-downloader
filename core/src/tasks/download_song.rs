@@ -239,6 +239,7 @@ impl Driver {
         tracing::info!("- starting download...");
         download_button.scroll_into_view()?;
         sleep(Duration::from_millis(500));
+        let download_requested_at = SystemTime::now();
         download_button.click()?;
         sleep(Duration::from_millis(500));
 
@@ -276,7 +277,7 @@ impl Driver {
         }
 
         // Wait for the download to complete
-        self.wait_for_download_completion(&filename)?;
+        self.wait_for_download_completion(&filename, download_requested_at)?;
 
         Ok(())
     }
@@ -305,7 +306,11 @@ impl Driver {
         Ok(decoded)
     }
 
-    fn wait_for_download_completion(&self, expected_filename: &str) -> Result<()> {
+    fn wait_for_download_completion(
+        &self,
+        expected_filename: &str,
+        download_requested_at: SystemTime,
+    ) -> Result<()> {
         let download_path = match &self.config.download_path {
             Some(path) => PathBuf::from(path),
             None => Self::get_default_download_dir()?,
@@ -337,8 +342,15 @@ impl Driver {
                         // Verify the final file actually exists
                         let final_path = download_path.join(expected_filename);
                         if final_path.exists() {
-                            tracing::info!("- download complete");
-                            return Ok(());
+                            let metadata = std::fs::metadata(&final_path)?;
+                            if file_was_newly_downloaded(
+                                metadata.len(),
+                                metadata.modified()?,
+                                download_requested_at,
+                            ) {
+                                tracing::info!("- download complete");
+                                return Ok(());
+                            }
                         }
                         // If .crdownload is gone but final file doesn't exist yet, keep waiting
                     }
@@ -1056,6 +1068,14 @@ fn browser_filename_matches_track(filename: &str, track_name: &str) -> bool {
     filename.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
 }
 
+fn file_was_newly_downloaded(
+    file_length: u64,
+    modified_at: SystemTime,
+    requested_at: SystemTime,
+) -> bool {
+    file_length > 0 && modified_at > requested_at
+}
+
 fn normalize_track_name(value: &str) -> String {
     value
         .split_whitespace()
@@ -1405,6 +1425,40 @@ mod browser_filename_tests {
         assert!(!browser_filename_matches_track(
             "Don_Henley_Dirty_Laundry(Bass_Custom_Backing_Track).mp3",
             "Synth Bass"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod browser_file_freshness_tests {
+    use super::file_was_newly_downloaded;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn rejects_existing_and_empty_files() {
+        let started = UNIX_EPOCH + Duration::from_secs(100);
+
+        assert!(!file_was_newly_downloaded(
+            1000,
+            started - Duration::from_secs(10),
+            started
+        ));
+
+        assert!(!file_was_newly_downloaded(
+            0,
+            started + Duration::from_secs(10),
+            started
+        ));
+    }
+
+    #[test]
+    fn accepts_new_nonempty_file() {
+        let started = UNIX_EPOCH + Duration::from_secs(100);
+
+        assert!(file_was_newly_downloaded(
+            1000,
+            started + Duration::from_secs(10),
+            started
         ));
     }
 }
