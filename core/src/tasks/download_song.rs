@@ -267,6 +267,14 @@ impl Driver {
         }
         sleep(Duration::from_secs(4));
 
+        if !browser_filename_matches_track(&filename, track_name) {
+            return Err(anyhow!(
+                "Requested track '{}' but browser download link offered '{}'",
+                track_name,
+                filename
+            ));
+        }
+
         // Wait for the download to complete
         self.wait_for_download_completion(&filename)?;
 
@@ -1028,6 +1036,26 @@ fn resolve_browser_challenge(
     }
 }
 
+fn browser_filename_matches_track(filename: &str, track_name: &str) -> bool {
+    let mut slug = String::new();
+
+    for ch in track_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '(' || ch == ')' {
+            slug.push(ch);
+        } else if !slug.ends_with('_') {
+            slug.push('_');
+        }
+    }
+
+    let slug = slug.trim_matches('_');
+    if slug.is_empty() {
+        return false;
+    }
+
+    let suffix = format!("({slug}_Custom_Backing_Track).mp3");
+    filename.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
+}
+
 fn normalize_track_name(value: &str) -> String {
     value
         .split_whitespace()
@@ -1349,6 +1377,35 @@ mod track_type_tests {
     fn extracts_click_from_description_containing_precount_control() {
         let description = "<div class='custom__mixer-track-caption-input'> Intro count</div><span class='custom__mixer-track-caption-name'>&nbsp;&nbsp;Click</span>";
         assert_eq!(super::normalize_metadata_track_name(description), "Click");
+    }
+}
+
+#[cfg(test)]
+mod browser_filename_tests {
+    use super::browser_filename_matches_track;
+
+    #[test]
+    fn accepts_matching_instrument_names() {
+        assert!(browser_filename_matches_track(
+            "Don_Henley_Dirty_Laundry(Click_Custom_Backing_Track).mp3",
+            "Click"
+        ));
+        assert!(browser_filename_matches_track(
+            "Don_Henley_Dirty_Laundry(Arr_Electric_Guitar_1_Custom_Backing_Track).mp3",
+            "Arr. Electric Guitar 1"
+        ));
+        assert!(browser_filename_matches_track(
+            "Don_Henley_Dirty_Laundry(Synth_Keys_(MS_20)_Custom_Backing_Track).mp3",
+            "Synth Keys (MS-20)"
+        ));
+    }
+
+    #[test]
+    fn rejects_another_instruments_filename() {
+        assert!(!browser_filename_matches_track(
+            "Don_Henley_Dirty_Laundry(Bass_Custom_Backing_Track).mp3",
+            "Synth Bass"
+        ));
     }
 }
 
