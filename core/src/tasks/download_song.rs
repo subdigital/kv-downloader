@@ -297,21 +297,57 @@ impl Driver {
         download_button.click()?;
         sleep(Duration::from_millis(500));
 
-        tracing::info!("- waiting for download modal...");
+        tracing::info!("- waiting for requested track file or MP3 link...");
 
-        // Increase timeout for retries
-        let timeout = Duration::from_secs(60 + (attempt as u64 - 1) * 30);
-        tab.wait_for_element_with_custom_timeout(".begin-download", timeout)
-            .map_err(|_| anyhow!("Timed out waiting for download modal after {:?}", timeout))?;
+        // Observe both the filesystem and browser while the mix is prepared.
+        let timeout = Duration::from_secs(30 + (attempt as u64 - 1) * 15);
+        let started = std::time::Instant::now();
+        let mut last_seen_filename: Option<String> = None;
 
-        // Wait a bit for the modal to be fully rendered
-        sleep(Duration::from_secs(1));
+        let filename = loop {
+            // A correct MP3 may finish before the browser link updates.
+            if self.completed_track_file_exists(track_name, track_started_at)? {
+                tracing::info!("- '{}' MP3 detected as complete", track_name);
 
-        // Extract the filename from the download link before closing the modal
-        let filename = self.extract_download_filename(tab).map_err(|e| {
-            anyhow!("Could not read MP3 download link for '{}': {}", track_name, e)
-        })?;
-        tracing::debug!("Expected download filename: {}", filename);
+                if let Ok(close_btn) = tab.find_element("button.js-modal-close") {
+                    let _ = close_btn.click();
+                }
+
+                return Ok(());
+            }
+
+            match self.extract_download_filename(tab) {
+                Ok(candidate) if browser_filename_matches_track(&candidate, track_name) => {
+                    break candidate;
+                }
+                Ok(candidate) => {
+                    if last_seen_filename.as_deref() != Some(candidate.as_str()) {
+                        tracing::info!(
+                            "Waiting for '{}' MP3; page still offers '{}'",
+                            track_name,
+                            candidate
+                        );
+                        last_seen_filename = Some(candidate);
+                    }
+                }
+                Err(_) => {
+                    // The new link may not have been rendered yet.
+                }
+            }
+
+            if started.elapsed() >= timeout {
+                return Err(anyhow!(
+                    "Timed out waiting for '{}' MP3 or correct link after {:?}; last offered={:?}",
+                    track_name,
+                    timeout,
+                    last_seen_filename
+                ));
+            }
+
+            sleep(Duration::from_millis(500));
+        };
+
+        tracing::debug!("Verified download filename: {}", filename);
 
         // Try to find and close the modal
         match tab.find_element("button.js-modal-close") {
