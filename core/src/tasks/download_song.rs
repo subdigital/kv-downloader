@@ -163,6 +163,7 @@ impl Driver {
             let mut attempts = 0;
             let max_attempts = 3;
             let mut download_successful = false;
+            let track_started_at = SystemTime::now();
 
             while attempts < max_attempts && !download_successful {
                 attempts += 1;
@@ -173,6 +174,7 @@ impl Driver {
                     &download_button,
                     &track_name,
                     attempts,
+                    track_started_at,
                 ) {
                     Ok(_) => {
                         download_successful = true;
@@ -226,6 +228,7 @@ impl Driver {
         download_button: &Element,
         track_name: &str,
         attempt: u32,
+        track_started_at: SystemTime,
     ) -> Result<()> {
         if attempt > 1 {
             tracing::info!("Attempt {} for track '{}'", attempt, track_name);
@@ -270,7 +273,7 @@ impl Driver {
         tracing::info!("- starting download...");
         download_button.scroll_into_view()?;
         sleep(Duration::from_millis(500));
-        let download_requested_at = SystemTime::now();
+        // Freshness is measured from the first attempt for this track.
         download_button.click()?;
         sleep(Duration::from_millis(500));
 
@@ -312,7 +315,7 @@ impl Driver {
         }
 
         // Wait for the download to complete
-        self.wait_for_download_completion(&filename, download_requested_at)?;
+        self.wait_for_download_completion(&filename, track_started_at)?;
 
         Ok(())
     }
