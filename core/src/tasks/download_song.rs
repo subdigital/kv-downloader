@@ -285,13 +285,17 @@ impl Driver {
         sleep(Duration::from_secs(1));
 
         // Extract the filename from the download link before closing the modal
-        let filename = self.extract_download_filename(tab)?;
+        let filename = self.extract_download_filename(tab).map_err(|e| {
+            anyhow!("Could not read MP3 download link for '{}': {}", track_name, e)
+        })?;
         tracing::debug!("Expected download filename: {}", filename);
 
         // Try to find and close the modal
         match tab.find_element("button.js-modal-close") {
             Ok(close_btn) => {
-                close_btn.click()?;
+                close_btn.click().map_err(|e| {
+                    anyhow!("Could not close download modal for '{}': {}", track_name, e)
+                })?;
             }
             Err(_) => {
                 tracing::warn!("Could not find modal close button, proceeding anyway");
