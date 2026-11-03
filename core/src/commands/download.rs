@@ -39,6 +39,9 @@ pub struct DownloadArgs {
     #[arg(short, long, help = "Whether to count in an intro for all tracks")]
     pub count_in: bool,
 
+    #[arg(long, value_delimiter = ',', help = "Comma-separated track names")]
+    pub tracks: Vec<String>,
+
     #[arg(long, help = "Force restart, ignoring any previous download progress")]
     pub force_restart: bool,
 
@@ -64,7 +67,7 @@ impl Download {
             let download_options = tasks::download_song::DownloadOptions {
                 count_in: args.count_in,
                 transpose: args.transpose.unwrap_or(0),
-                selected_tracks: None,
+                selected_tracks: (!args.tracks.is_empty()).then(|| args.tracks.clone()),
                 force_restart: args.force_restart,
             };
             tracing::info!("Using HTTP downloader");
@@ -105,7 +108,7 @@ impl Download {
         let download_options = tasks::download_song::DownloadOptions {
             count_in: args.count_in,
             transpose: args.transpose.unwrap_or(0),
-            selected_tracks: None,
+            selected_tracks: (!args.tracks.is_empty()).then(|| args.tracks.clone()),
             force_restart: args.force_restart,
         };
         driver.download_song(&args.song_url, download_options)?;
