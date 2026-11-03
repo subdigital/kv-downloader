@@ -188,6 +188,26 @@ impl Driver {
                             tracing::info!("Waiting {:?} before retry...", wait_time);
                             sleep(wait_time);
                         }
+
+                        // The correct MP3 may have completed after a browser error.
+                        match self.completed_track_file_exists(&track_name, track_started_at) {
+                            Ok(true) => {
+                                download_successful = true;
+                                tracing::info!(
+                                    "- '{}' already downloaded; skipping retry",
+                                    track_name
+                                );
+                                self.progress.mark_track_downloaded(&track_name)?;
+                            }
+                            Ok(false) => {}
+                            Err(check_error) => {
+                                tracing::warn!(
+                                    "Could not check completed file for '{}': {}",
+                                    track_name,
+                                    check_error
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -342,6 +362,23 @@ impl Driver {
             .to_string();
 
         Ok(decoded)
+    }
+
+    fn completed_track_file_exists(
+        &self,
+        track_name: &str,
+        track_started_at: SystemTime,
+    ) -> Result<bool> {
+        let download_path = match &self.config.download_path {
+            Some(path) => PathBuf::from(path),
+            None => Self::get_default_download_dir()?,
+        };
+
+        completed_track_file_exists_in_dir(
+            &download_path,
+            track_name,
+            track_started_at,
+        )
     }
 
     fn wait_for_download_completion(
@@ -1086,6 +1123,131 @@ fn resolve_browser_challenge(
     }
 }
 
+fn completed_track_file_exists_in_dir(
+    download_path: &std::path::Path,
+    track_name: &str,
+    track_started_at: SystemTime,
+) -> Result<bool> {
+    for entry in std::fs::read_dir(download_path)? {
+        let entry = entry?;
+        let filename = entry.file_name().to_string_lossy().into_owned();
+
+        if !browser_filename_matches_track(&filename, track_name) {
+            continue;
+        }
+
+        let metadata = entry.metadata()?;
+
+        if !metadata.is_file() {
+            continue;
+        }
+
+        if !file_was_newly_downloaded(
+            metadata.len(),
+            metadata.modified()?,
+            track_started_at,
+        ) {
+            continue;
+        }
+
+        let incomplete = download_path.join(
+            format!("{}.crdownload", filename)
+        );
+
+        if incomplete.exists() {
+            continue;
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+#[cfg(test)]
+mod browser_completed_file_tests {
+    use super::completed_track_file_exists_in_dir;
+    use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn verifies_completed_track_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir = std::env::temp_dir().join(format!(
+            "kv-completed-file-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let filename =
+            "Don_Henley_Dirty_Laundry(Bass_Custom_Backing_Track).mp3";
+
+        let file = dir.join(filename);
+
+        fs::write(&file, b"test audio data").unwrap();
+
+        let modified = fs::metadata(&file)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let started_before = modified - Duration::from_secs(1);
+        let started_after = modified + Duration::from_secs(1);
+
+        // Correct, fresh, nonempty file: accept.
+        assert!(
+            completed_track_file_exists_in_dir(
+                &dir, "Bass", started_before
+            ).unwrap()
+        );
+
+        // Wrong instrument: reject.
+        assert!(
+            !completed_track_file_exists_in_dir(
+                &dir, "Synth Bass", started_before
+            ).unwrap()
+        );
+
+        // File predates processing: reject.
+        assert!(
+            !completed_track_file_exists_in_dir(
+                &dir, "Bass", started_after
+            ).unwrap()
+        );
+
+        // Incomplete Chrome download: reject.
+        let incomplete = dir.join(format!(
+            "{}.crdownload", filename
+        ));
+
+        fs::write(&incomplete, b"partial").unwrap();
+
+        assert!(
+            !completed_track_file_exists_in_dir(
+                &dir, "Bass", started_before
+            ).unwrap()
+        );
+
+        fs::remove_file(&incomplete).unwrap();
+
+        // Empty MP3: reject.
+        fs::write(&file, b"").unwrap();
+
+        assert!(
+            !completed_track_file_exists_in_dir(
+                &dir, "Bass", started_before
+            ).unwrap()
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
 fn browser_filename_matches_track(filename: &str, track_name: &str) -> bool {
     let mut slug = String::new();
 
