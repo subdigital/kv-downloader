@@ -432,7 +432,7 @@ impl Driver {
                 .call_js_fn(
                     r#"
                     function get_name() {
-                        return this.lastChild.nodeValue.trim();
+                        return (this.querySelector(".custom__mixer-track-caption-name")?.textContent || this.lastChild?.nodeValue || "").trim();
                     }
                     "#,
                     vec![],
