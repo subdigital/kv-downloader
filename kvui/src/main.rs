@@ -3048,6 +3048,22 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                             app.screen = Screen::SongDetail;
                             return Ok(false);
                         }
+                        let song_destination = match (|| -> Result<PathBuf> {
+                            kvui_check_destination_directory(&download_dir)?;
+                            kvui_select_song_destination(
+                                &download_dir,
+                                &song.artist,
+                                &song.title,
+                                &song.url,
+                            )
+                        })() {
+                            Ok(path) => path,
+                            Err(err) => {
+                                app.status = format!("Cannot select song folder: {err}");
+                                app.screen = Screen::SongDetail;
+                                return Ok(false);
+                            }
+                        };
                         let download_tracks = selected_tracks
                             .iter()
                             .map(|name| TrackStatusItem {
@@ -3057,8 +3073,11 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                             })
                             .collect::<Vec<_>>();
                         let song_url = song.url.clone();
+                        let song_artist = song.artist.clone();
+                        let song_title = song.title.clone();
                         let logs = app.logs.clone();
                         let worker_download_dir = download_dir.clone();
+                        let worker_song_destination = song_destination.clone();
                         let handle = std::thread::spawn(move || {
                             let _guard = LogScope::new(logs);
                             let prepared = prepare_staged_download(
@@ -3070,6 +3089,13 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                                 &worker_download_dir,
                             )?;
 
+                            kvui_prepare_song_destination(
+                                &worker_download_dir,
+                                &song_artist,
+                                &song_title,
+                                &song_url,
+                                &worker_song_destination,
+                            )?;
                             let mut created = 0usize;
                             let mut replaced = 0usize;
                             let mut kept = 0usize;
@@ -3077,7 +3103,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                             for staged in &prepared.files {
                                 let outcome = tasks::download_song::publish_staged_file(
                                     staged,
-                                    &worker_download_dir,
+                                    &worker_song_destination,
                                     file_policy.ok_or_else(|| anyhow!("Missing download policy"))?,
                                 )?;
 
@@ -3114,7 +3140,7 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                             done: None,
                             started_at: Instant::now(),
                             duration: None,
-                            download_dir,
+                            download_dir: song_destination,
                         });
                         app.screen = Screen::DownloadStatus;
                     }
@@ -3415,5 +3441,860 @@ mod song_catalog_tests {
             download_dir
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+
+/// Convert an artist or song title into a safe folder component.
+/// Invalid Windows filename characters become underscores.
+/// Empty or excessively long results are rejected.
+#[allow(dead_code)]
+fn kvui_safe_folder_component(raw: &str) -> Result<String> {
+    let mut name = String::new();
+
+    for ch in raw.trim().chars() {
+        if ch.is_control()
+            || matches!(
+                ch,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+        {
+            name.push('_');
+        } else {
+            name.push(ch);
+        }
+    }
+
+    // Windows does not permit trailing periods or spaces.
+    let mut name = name.trim_end_matches([' ', '.']).to_string();
+
+    if name.is_empty() {
+        return Err(anyhow!("Artist or song title produces an empty folder name"));
+    }
+
+    // Windows reserves these device names, even with extensions.
+    let base = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+
+    let reserved = matches!(
+        base.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+        | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
+        | "COM6" | "COM7" | "COM8" | "COM9"
+        | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5"
+        | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        | "CONIN$" | "CONOUT$"
+        | "COM¹" | "COM²" | "COM³"
+        | "LPT¹" | "LPT²" | "LPT³"
+    );
+
+    if reserved {
+        name.push('_');
+    }
+
+    // Reject long titles rather than silently truncate them
+    // and risk two different songs sharing the same folder.
+    if name.chars().count() > 100 {
+        return Err(anyhow!("Artist or song folder name is too long"));
+    }
+
+    Ok(name)
+}
+
+#[cfg(test)]
+mod artist_song_folder_names {
+    use super::kvui_safe_folder_component;
+
+    #[test]
+    fn preserves_normal_names() {
+        assert_eq!(
+            kvui_safe_folder_component("Eagles").unwrap(),
+            "Eagles"
+        );
+
+        assert_eq!(
+            kvui_safe_folder_component("Hotel California").unwrap(),
+            "Hotel California"
+        );
+    }
+
+    #[test]
+    fn replaces_windows_invalid_characters() {
+        assert_eq!(
+            kvui_safe_folder_component("AC/DC").unwrap(),
+            "AC_DC"
+        );
+
+        assert_eq!(
+            kvui_safe_folder_component("Who: Me?").unwrap(),
+            "Who_ Me_"
+        );
+    }
+
+    #[test]
+    fn removes_trailing_spaces_and_periods() {
+        assert_eq!(
+            kvui_safe_folder_component("  Queen  ").unwrap(),
+            "Queen"
+        );
+
+        assert_eq!(
+            kvui_safe_folder_component("My Song. ").unwrap(),
+            "My Song"
+        );
+    }
+
+    #[test]
+    fn handles_reserved_windows_names() {
+        assert_eq!(
+            kvui_safe_folder_component("CON").unwrap(),
+            "CON_"
+        );
+
+        assert_eq!(
+            kvui_safe_folder_component("nul.txt").unwrap(),
+            "nul.txt_"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_unsafe_names() {
+        assert!(kvui_safe_folder_component("").is_err());
+        assert!(kvui_safe_folder_component("...").is_err());
+        assert!(kvui_safe_folder_component("   ").is_err());
+
+        let long_name = "A".repeat(101);
+        assert!(kvui_safe_folder_component(&long_name).is_err());
+    }
+}
+
+
+/// Construct an Artist/Song destination under the selected download root.
+/// Does not create directories or modify files.
+#[allow(dead_code)]
+fn kvui_song_destination_dir(
+    download_root: &Path,
+    artist: &str,
+    title: &str,
+) -> Result<PathBuf> {
+    let artist_folder = kvui_safe_folder_component(artist)?;
+    let song_folder = kvui_safe_folder_component(title)?;
+
+    Ok(download_root.join(artist_folder).join(song_folder))
+}
+
+#[cfg(test)]
+mod artist_song_destination_tests {
+    use super::kvui_song_destination_dir;
+    use std::path::Path;
+
+    #[test]
+    fn builds_artist_song_structure() {
+        let root = Path::new("download-root");
+
+        let result = kvui_song_destination_dir(
+            root,
+            "Eagles",
+            "Hotel California",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            root.join("Eagles").join("Hotel California")
+        );
+    }
+
+    #[test]
+    fn sanitizes_folder_components() {
+        let root = Path::new("download-root");
+
+        let result = kvui_song_destination_dir(
+            root,
+            "AC/DC",
+            "Who: Me?",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            root.join("AC_DC").join("Who_ Me_")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_components() {
+        let root = Path::new("download-root");
+
+        assert!(
+            kvui_song_destination_dir(root, "", "Song").is_err()
+        );
+
+        assert!(
+            kvui_song_destination_dir(root, "Artist", "...").is_err()
+        );
+
+        assert!(
+            kvui_song_destination_dir(root, "Artist", "").is_err()
+        );
+    }
+}
+
+
+/// The source URL identifies the recording assigned to a song folder.
+/// The marker will be written during the publishing integration step.
+const KVUI_SONG_SOURCE_FILE: &str = ".kvui-song-source";
+
+/// Check an existing directory without following unsafe folder links.
+/// Returns false when the directory does not exist.
+#[allow(dead_code)]
+fn kvui_check_destination_directory(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("Destination is a symbolic link: {}", path.display()));
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        // FILE_ATTRIBUTE_REPARSE_POINT includes Windows junctions.
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(anyhow!(
+                "Destination is a Windows reparse point: {}",
+                path.display()
+            ));
+        }
+    }
+
+    if !metadata.is_dir() {
+        return Err(anyhow!(
+            "Destination exists but is not a directory: {}",
+            path.display()
+        ));
+    }
+
+    Ok(true)
+}
+
+/// An existing folder belongs to this recording only when its
+/// source marker matches the exact Karaoke-Version URL.
+#[allow(dead_code)]
+fn kvui_song_folder_matches_source(
+    folder: &Path,
+    song_url: &str,
+) -> Result<bool> {
+    let marker = folder.join(KVUI_SONG_SOURCE_FILE);
+
+    match std::fs::read_to_string(marker) {
+        Ok(value) => Ok(value == song_url.trim()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Produce a repeatable alternative folder name when the normal
+/// Artist/Song location already belongs to something else.
+#[allow(dead_code)]
+fn kvui_collision_song_folder(title: &str, song_url: &str) -> Result<String> {
+    if song_url.trim().is_empty() {
+        return Err(anyhow!("Song URL cannot be empty"));
+    }
+
+    // Stable FNV-1a fingerprint. Source markers provide the
+    // authoritative collision check; the hash is only a suffix.
+    let mut hash: u64 = 0xcbf29ce484222325;
+
+    for byte in song_url.trim().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    let suffix = format!(" [KV-{hash:016x}]");
+    let title = kvui_safe_folder_component(title)?;
+
+    let limit = 100usize - suffix.chars().count();
+
+    let prefix: String = title.chars().take(limit).collect();
+    let prefix = prefix.trim_end_matches([' ', '.']);
+
+    Ok(format!("{prefix}{suffix}"))
+}
+
+/// Select a destination without creating or modifying directories.
+///
+/// Existing unmarked folders are not considered KVUI-owned.
+/// An alternate destination is selected in that situation.
+/// An occupied alternate destination must have a matching marker.
+#[allow(dead_code)]
+fn kvui_select_song_destination(
+    download_root: &Path,
+    artist: &str,
+    title: &str,
+    song_url: &str,
+) -> Result<PathBuf> {
+    if song_url.trim().is_empty() {
+        return Err(anyhow!("Song URL cannot be empty"));
+    }
+
+    if !download_root.is_dir() {
+        return Err(anyhow!("Download root does not exist"));
+    }
+
+    let base = kvui_song_destination_dir(
+        download_root,
+        artist,
+        title,
+    )?;
+
+    let artist_dir = base
+        .parent()
+        .ok_or_else(|| anyhow!("Missing artist directory"))?;
+
+    kvui_check_destination_directory(artist_dir)?;
+
+    if !kvui_check_destination_directory(&base)? {
+        return Ok(base);
+    }
+
+    if kvui_song_folder_matches_source(&base, song_url)? {
+        return Ok(base);
+    }
+
+    let alternate_name = kvui_collision_song_folder(title, song_url)?;
+    let alternate = artist_dir.join(alternate_name);
+
+    if !kvui_check_destination_directory(&alternate)? {
+        return Ok(alternate);
+    }
+
+    if kvui_song_folder_matches_source(&alternate, song_url)? {
+        return Ok(alternate);
+    }
+
+    Err(anyhow!(
+        "Song destination collision cannot be resolved safely"
+    ))
+}
+
+#[cfg(test)]
+mod artist_song_collision_tests {
+    use super::{
+        kvui_select_song_destination,
+        KVUI_SONG_SOURCE_FILE,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_root() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "kvui-collision-test-{}-{stamp}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn selects_clean_artist_song_path() {
+        let root = temporary_root();
+
+        let result = kvui_select_song_destination(
+            &root, "Eagles", "Hotel California", "https://example.test/1"
+        ).unwrap();
+
+        assert_eq!(
+            result,
+            root.join("Eagles").join("Hotel California")
+        );
+
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn reuses_folder_with_matching_source() {
+        let root = temporary_root();
+        let folder = root.join("Eagles").join("Hotel California");
+
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(KVUI_SONG_SOURCE_FILE),
+            "https://example.test/1",
+        ).unwrap();
+
+        let result = kvui_select_song_destination(
+            &root, "Eagles", "Hotel California", "https://example.test/1"
+        ).unwrap();
+
+        assert_eq!(result, folder);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn protects_unmarked_existing_folder() {
+        let root = temporary_root();
+        let folder = root.join("Eagles").join("Hotel California");
+
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("Existing.mp3"), b"untouched").unwrap();
+
+        let result = kvui_select_song_destination(
+            &root, "Eagles", "Hotel California", "https://example.test/1"
+        ).unwrap();
+
+        assert_ne!(result, folder);
+        assert_eq!(
+            fs::read(folder.join("Existing.mp3")).unwrap(),
+            b"untouched"
+        );
+
+        assert!(result
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("[KV-"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn separates_different_recordings() {
+        let root = temporary_root();
+        let folder = root.join("Eagles").join("Hotel California");
+
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(KVUI_SONG_SOURCE_FILE),
+            "https://example.test/old",
+        ).unwrap();
+
+        let result = kvui_select_song_destination(
+            &root, "Eagles", "Hotel California", "https://example.test/new"
+        ).unwrap();
+
+        assert_ne!(result, folder);
+
+        // An occupied alternative without a matching marker
+        // must cause an error rather than overwrite anything.
+        fs::create_dir(&result).unwrap();
+
+        assert!(kvui_select_song_destination(
+            &root, "Eagles", "Hotel California", "https://example.test/new"
+        ).is_err());
+
+        fs::write(
+            result.join(KVUI_SONG_SOURCE_FILE),
+            "https://example.test/new",
+        ).unwrap();
+
+        assert_eq!(
+            kvui_select_song_destination(
+                &root, "Eagles", "Hotel California", "https://example.test/new"
+            ).unwrap(),
+            result
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rejects_artist_path_that_is_a_file() {
+        let root = temporary_root();
+        fs::write(root.join("Eagles"), b"existing file").unwrap();
+
+        assert!(kvui_select_song_destination(
+            &root, "Eagles", "Hotel California", "https://example.test/1"
+        ).is_err());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_source_url() {
+        let root = temporary_root();
+
+        assert!(kvui_select_song_destination(
+            &root, "Eagles", "Hotel California", ""
+        ).is_err());
+
+        fs::remove_dir(&root).unwrap();
+    }
+}
+
+
+/// Prepare a previously selected Artist/Song destination.
+///
+/// This function must be called only after staged tracks have been
+/// downloaded and verified. It does not move or replace MP3 files.
+///
+/// The source marker prevents another recording from silently
+/// sharing the same song folder.
+#[allow(dead_code)]
+fn kvui_prepare_song_destination(
+    download_root: &Path,
+    artist: &str,
+    title: &str,
+    song_url: &str,
+    expected_destination: &Path,
+) -> Result<()> {
+    // The destination must still be the correct choice.
+    // A folder could have appeared since initial selection.
+    let current_selection = kvui_select_song_destination(
+        download_root,
+        artist,
+        title,
+        song_url,
+    )?;
+
+    if current_selection.as_path() != expected_destination {
+        return Err(anyhow!(
+            "Song destination changed before publishing; refusing to overwrite"
+        ));
+    }
+
+    // Never create folders through an unsafe download root.
+    if !kvui_check_destination_directory(download_root)? {
+        return Err(anyhow!("Download root does not exist"));
+    }
+
+    let artist_dir = expected_destination
+        .parent()
+        .ok_or_else(|| anyhow!("Song destination has no parent"))?;
+
+    // Create the artist directory without recursively traversing
+    // unexpected intermediate directories.
+    if !kvui_check_destination_directory(artist_dir)? {
+        std::fs::create_dir(artist_dir)?;
+    }
+
+    if !kvui_check_destination_directory(artist_dir)? {
+        return Err(anyhow!("Artist directory is unavailable"));
+    }
+
+    // A new song folder receives a source marker.
+    // An existing folder must already have a matching marker.
+    if !kvui_check_destination_directory(expected_destination)? {
+        std::fs::create_dir(expected_destination)?;
+
+        if !kvui_check_destination_directory(expected_destination)? {
+            return Err(anyhow!("Song directory is unavailable"));
+        }
+
+        let marker_path = expected_destination
+            .join(KVUI_SONG_SOURCE_FILE);
+
+        // create_new prevents accidentally replacing an existing marker.
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)?;
+
+        std::io::Write::write_all(
+            &mut marker,
+            song_url.trim().as_bytes(),
+        )?;
+
+        marker.sync_all()?;
+    }
+
+    // Final ownership verification before file publishing.
+    if !kvui_song_folder_matches_source(
+        expected_destination,
+        song_url,
+    )? {
+        return Err(anyhow!(
+            "Song folder is not assigned to this recording"
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod artist_song_preparation_tests {
+    use super::{
+        kvui_prepare_song_destination,
+        kvui_select_song_destination,
+        KVUI_SONG_SOURCE_FILE,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const SOURCE: &str = "https://example.test/recording/123";
+
+    fn temporary_root() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "kvui-preparation-test-{}-{stamp}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn creates_artist_song_folders_and_marker() {
+        let root = temporary_root();
+
+        let destination = kvui_select_song_destination(
+            &root,
+            "Eagles",
+            "Hotel California",
+            SOURCE,
+        ).unwrap();
+
+        kvui_prepare_song_destination(
+            &root,
+            "Eagles",
+            "Hotel California",
+            SOURCE,
+            &destination,
+        ).unwrap();
+
+        assert!(destination.is_dir());
+
+        assert_eq!(
+            fs::read_to_string(
+                destination.join(KVUI_SONG_SOURCE_FILE)
+            ).unwrap(),
+            SOURCE
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reuses_matching_folder_without_touching_files() {
+        let root = temporary_root();
+
+        let destination = kvui_select_song_destination(
+            &root,
+            "Eagles",
+            "Hotel California",
+            SOURCE,
+        ).unwrap();
+
+        kvui_prepare_song_destination(
+            &root, "Eagles", "Hotel California",
+            SOURCE, &destination,
+        ).unwrap();
+
+        fs::write(
+            destination.join("Existing.mp3"),
+            b"original contents",
+        ).unwrap();
+
+        kvui_prepare_song_destination(
+            &root, "Eagles", "Hotel California",
+            SOURCE, &destination,
+        ).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("Existing.mp3")).unwrap(),
+            b"original contents"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preserves_unmarked_folder_and_creates_alternative() {
+        let root = temporary_root();
+
+        let original = root
+            .join("Eagles")
+            .join("Hotel California");
+
+        fs::create_dir_all(&original).unwrap();
+        fs::write(
+            original.join("Existing.mp3"),
+            b"do not replace",
+        ).unwrap();
+
+        let destination = kvui_select_song_destination(
+            &root,
+            "Eagles",
+            "Hotel California",
+            SOURCE,
+        ).unwrap();
+
+        assert_ne!(destination, original);
+
+        kvui_prepare_song_destination(
+            &root, "Eagles", "Hotel California",
+            SOURCE, &destination,
+        ).unwrap();
+
+        assert!(destination.is_dir());
+
+        assert_eq!(
+            fs::read(original.join("Existing.mp3")).unwrap(),
+            b"do not replace"
+        );
+
+        assert_eq!(
+            fs::read_to_string(
+                destination.join(KVUI_SONG_SOURCE_FILE)
+            ).unwrap(),
+            SOURCE
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_destination_changed_after_selection() {
+        let root = temporary_root();
+
+        let destination = kvui_select_song_destination(
+            &root,
+            "Eagles",
+            "Hotel California",
+            SOURCE,
+        ).unwrap();
+
+        // Simulate a different process occupying the selected path.
+        fs::create_dir_all(&destination).unwrap();
+
+        fs::write(
+            destination.join(KVUI_SONG_SOURCE_FILE),
+            "https://example.test/another-recording",
+        ).unwrap();
+
+        assert!(kvui_prepare_song_destination(
+            &root, "Eagles", "Hotel California",
+            SOURCE, &destination,
+        ).is_err());
+
+        assert_eq!(
+            fs::read_to_string(
+                destination.join(KVUI_SONG_SOURCE_FILE)
+            ).unwrap(),
+            "https://example.test/another-recording"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_artist_path_occupied_by_file() {
+        let root = temporary_root();
+
+        fs::write(
+            root.join("Eagles"),
+            b"existing file",
+        ).unwrap();
+
+        let destination = root
+            .join("Eagles")
+            .join("Hotel California");
+
+        assert!(kvui_prepare_song_destination(
+            &root, "Eagles", "Hotel California",
+            SOURCE, &destination,
+        ).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod artist_song_publish_integration_tests {
+    use super::{
+        kvui_prepare_song_destination,
+        kvui_select_song_destination,
+        KVUI_SONG_SOURCE_FILE,
+    };
+    use kv_core::tasks::download_song::{
+        create_download_staging_dir,
+        publish_staged_file,
+        ExistingFilePolicy,
+        PublishOutcome,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn verified_file_publishes_into_artist_song_folder() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "kvui-publish-integration-{}-{stamp}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&root).unwrap();
+
+        let url = "https://example.test/recording/123";
+
+        // Staging remains directly under the download root.
+        let staging = create_download_staging_dir(&root).unwrap();
+        let staged_file = staging.join("Bass.mp3");
+
+        fs::write(&staged_file, b"test MP3 data").unwrap();
+
+        let destination = kvui_select_song_destination(
+            &root,
+            "Eagles",
+            "Hotel California",
+            url,
+        ).unwrap();
+
+        kvui_prepare_song_destination(
+            &root,
+            "Eagles",
+            "Hotel California",
+            url,
+            &destination,
+        ).unwrap();
+
+        let outcome = publish_staged_file(
+            &staged_file,
+            &destination,
+            ExistingFilePolicy::Keep,
+        ).unwrap();
+
+        assert_eq!(outcome, PublishOutcome::Created);
+
+        assert_eq!(
+            fs::read(destination.join("Bass.mp3")).unwrap(),
+            b"test MP3 data"
+        );
+
+        assert_eq!(
+            fs::read_to_string(
+                destination.join(KVUI_SONG_SOURCE_FILE)
+            ).unwrap(),
+            url
+        );
+
+        assert!(!root.join("Bass.mp3").exists());
+        assert!(!staged_file.exists());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }
