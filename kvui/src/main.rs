@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -409,7 +409,9 @@ fn run_tui(diagnostics_path: Option<PathBuf>, demo_screen: Option<DemoScreen>) -
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
-                if handle_key_event(&mut terminal, &mut app, key)? {
+                if key.kind == KeyEventKind::Press
+                    && handle_key_event(&mut terminal, &mut app, key)?
+                {
                     break;
                 }
             }
