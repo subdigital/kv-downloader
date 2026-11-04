@@ -1207,10 +1207,21 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
         })
         .collect();
 
+    let selected_count = app.tracks
+        .iter()
+        .filter(|track| track.selected)
+        .count();
+
+    let track_count = format!(
+        "{} of {} tracks selected",
+        selected_count,
+        app.tracks.len()
+    );
+
     let track_block_title = if app.detail_focus == DetailFocus::Tracks {
-        "Tracks (space to toggle)"
+        format!("Tracks (space to toggle) | {track_count}")
     } else {
-        "Tracks"
+        format!("Tracks | {track_count}")
     };
 
     let list = List::new(items)
