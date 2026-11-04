@@ -473,7 +473,7 @@ fn handle_menu_keys(
     key: KeyEvent,
 ) -> Result<bool> {
     match key.code {
-        KeyCode::Esc => return Ok(true),
+        KeyCode::Esc => {},
         KeyCode::Up => {
             if app.menu_index > 0 {
                 app.menu_index -= 1;
