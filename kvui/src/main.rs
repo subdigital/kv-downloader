@@ -148,7 +148,7 @@ impl App {
             tracks_state: ListState::default(),
             detail_focus: DetailFocus::Tracks,
             intro_click: true,
-            use_browser: true,
+            use_browser: false,
             key_shift: 0,
             base_key: None,
             status: String::new(),
