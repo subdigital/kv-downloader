@@ -114,6 +114,27 @@ impl DownloadProgress {
         self.save(&progress)
     }
 
+    /// Start a fresh request while leaving unrelated download records intact.
+    pub fn start_fresh_download(&self, url: &str, count_in: bool, transpose: i8) -> Result<()> {
+        let mut progress = self.load_or_create()?;
+        let key = DownloadKey {
+            url: url.to_string(),
+            count_in,
+            transpose,
+        };
+
+        if let Some(record) = progress.downloads.iter_mut().find(|record| record.key == key) {
+            record.completed_tracks.clear();
+        } else {
+            progress.downloads.push(DownloadRecord {
+                key: key.clone(),
+                completed_tracks: Vec::new(),
+            });
+        }
+
+        progress.active_download = Some(key);
+        self.save(&progress)
+    }
     pub fn is_same_download(&self, url: &str, count_in: bool, transpose: i8) -> Result<bool> {
         if !self.progress_file.exists() {
             return Ok(false);
@@ -335,6 +356,32 @@ mod tests {
         assert!(progress.is_track_downloaded("Drum Kit").unwrap());
         progress.set_download("song-two", false, 0).unwrap();
         assert!(progress.is_track_downloaded("Bass").unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fresh_download_clears_only_requested_mix() {
+        let directory = temporary_directory();
+        let progress = DownloadProgress::new_for_test(&directory);
+
+        progress.set_download("song-one", true, 0).unwrap();
+        progress.mark_track_downloaded("Bass").unwrap();
+
+        progress.set_download("song-one", false, 0).unwrap();
+        progress.mark_track_downloaded("Drum Kit").unwrap();
+
+        progress.set_download("song-two", true, 0).unwrap();
+        progress.mark_track_downloaded("Piano").unwrap();
+
+        progress.start_fresh_download("song-one", true, 0).unwrap();
+        assert!(!progress.is_track_downloaded("Bass").unwrap());
+
+        progress.set_download("song-one", false, 0).unwrap();
+        assert!(progress.is_track_downloaded("Drum Kit").unwrap());
+
+        progress.set_download("song-two", true, 0).unwrap();
+        assert!(progress.is_track_downloaded("Piano").unwrap());
+
         fs::remove_dir_all(directory).unwrap();
     }
 

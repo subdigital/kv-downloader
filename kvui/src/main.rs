@@ -107,6 +107,7 @@ struct App {
     tracks_state: ListState,
     detail_focus: DetailFocus,
     intro_click: bool,
+    use_browser: bool,
     key_shift: i8,
     base_key: Option<String>,
     status: String,
@@ -139,7 +140,8 @@ impl App {
             tracks: Vec::new(),
             tracks_state: ListState::default(),
             detail_focus: DetailFocus::Tracks,
-            intro_click: false,
+            intro_click: true,
+            use_browser: true,
             key_shift: 0,
             base_key: None,
             status: String::new(),
@@ -796,6 +798,9 @@ fn handle_detail_keys(
         KeyCode::Char('i') => {
             app.intro_click = !app.intro_click;
         }
+        KeyCode::Char('b') => {
+            app.use_browser = !app.use_browser;
+        }
         KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Right => {
             if app.key_shift < 4 {
                 app.key_shift += 1;
@@ -821,16 +826,23 @@ fn handle_detail_keys(
                         return Ok(false);
                     }
                     app.confirm = Some(ConfirmState {
-                        message: vec![
-                            "This will start a Chromium browser then minimize it.".to_string(),
-                            "For more reliable downloads, make sure you don't interact with this window at all."
-                                .to_string(),
-                            "Continue?".to_string(),
-                        ],
+                        message: if app.use_browser {
+                            vec![
+                                "This will open a visible Chromium browser.".to_string(),
+                                "Do not interact with the browser during downloading.".to_string(),
+                                "Continue?".to_string(),
+                            ]
+                        } else {
+                            vec![
+                                "This will use the original HTTP downloader.".to_string(),
+                                "Continue?".to_string(),
+                            ]
+                        },
                         selected: 0,
                         payload: ConfirmPayload::StartDownload {
                             song,
                             selected_tracks,
+                            use_browser: app.use_browser,
                             intro_click: app.intro_click,
                             key_shift: app.key_shift,
                         },
@@ -1050,8 +1062,10 @@ fn render_detail(frame: &mut ratatui::Frame, app: &mut App) {
             Span::raw("   "),
             Span::styled("Key: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(key_display),
+            Span::raw("   Method: "),
+            Span::raw(if app.use_browser { "Chromium" } else { "HTTP" }),
         ]),
-        Line::from("Toggle intro click with 'i'. Adjust key with +/- or arrows."),
+        Line::from("i: Intro Click   b: Chromium/HTTP   +/-: Key"),
         Line::from(vec![
             Span::styled(
                 "Download folder: ",
@@ -1409,6 +1423,7 @@ fn login_flow() -> Result<()> {
 
 fn start_download(
     song_url: &str,
+    use_browser: bool,
     count_in: bool,
     transpose: i8,
     selected_tracks: Vec<String>,
@@ -1426,16 +1441,101 @@ fn start_download(
         },
         force_restart: false,
     };
-    tracing::info!("Using HTTP downloader");
-    tasks::download_song::download_song_http(
-        song_url,
-        download_options,
-        Some(download_dir.to_string_lossy().into_owned()),
-        &domain,
-    )?;
+    if use_browser {
+        tracing::info!("Using Chromium browser automation (headless: false)");
+
+        let config = driver::Config {
+            domain,
+            headless: false,
+            download_path: Some(download_dir.to_string_lossy().trim_start_matches(r"\\?\").to_owned()),
+            idle_browser_timeout: Duration::from_secs(300),
+            profile_dir: driver::default_profile_dir(),
+        };
+
+        let driver = driver::Driver::new(config);
+
+        let credentials = match (
+            std::env::var("KV_USERNAME"),
+            std::env::var("KV_PASSWORD"),
+        ) {
+            (Ok(user), Ok(password)) => keystore::Credentials { user, password },
+            _ => keystore::Keystore::get_credentials().map_err(|e| {
+                anyhow!("Browser authentication requires saved credentials: {}", e)
+            })?,
+        };
+
+        driver.sign_in(&credentials.user, &credentials.password)?;
+        driver.download_song(song_url, download_options)?;
+
+        // Match the tested CLI's post-download browser grace period.
+        std::thread::sleep(Duration::from_secs(10));
+    } else {
+        tracing::info!("Using HTTP downloader");
+        tasks::download_song::download_song_http(
+            song_url,
+            download_options,
+            Some(download_dir.to_string_lossy().into_owned()),
+            &domain,
+        )?;
+    }
     Ok(())
 }
 
+#[allow(dead_code)]
+struct PreparedDownload {
+    staging_dir: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+/// Prepare and verify downloads without changing destination files.
+#[allow(dead_code)]
+fn prepare_staged_download(
+    song_url: &str,
+    use_browser: bool,
+    count_in: bool,
+    transpose: i8,
+    selected_tracks: Vec<String>,
+    destination_dir: &Path,
+) -> Result<PreparedDownload> {
+    let staging_dir =
+        tasks::download_song::create_download_staging_dir(destination_dir)?;
+
+    let result = (|| -> Result<Vec<PathBuf>> {
+        kv_core::download_progress::DownloadProgress::new()
+            .start_fresh_download(song_url, count_in, transpose)?;
+
+        start_download(
+            song_url,
+            use_browser,
+            count_in,
+            transpose,
+            selected_tracks.clone(),
+            &staging_dir,
+        )?;
+
+        tasks::download_song::verify_staged_tracks(
+            &staging_dir,
+            &selected_tracks,
+        )
+    })();
+
+    match result {
+        Ok(files) => Ok(PreparedDownload {
+            staging_dir,
+            files,
+        }),
+        Err(err) => {
+            if let Err(cleanup_error) = fs::remove_dir_all(&staging_dir) {
+                tracing::warn!(
+                    "Could not clean up staging folder {}: {}",
+                    staging_dir.display(),
+                    cleanup_error
+                );
+            }
+            Err(err)
+        }
+    }
+}
 fn extract_domain_from_url(url: &str) -> Option<String> {
     Url::parse(url)
         .ok()
@@ -1772,27 +1872,8 @@ fn update_download_state(app: &mut App) {
         return;
     };
 
-    let progress = kv_core::download_progress::DownloadProgress::new();
-    let completed = if progress
-        .is_same_download(&download.song.url, download.count_in, download.transpose)
-        .unwrap_or(false)
-    {
-        progress
-            .get_completed_tracks()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|name| normalize_track_name(&name))
-            .collect::<std::collections::HashSet<_>>()
-    } else {
-        std::collections::HashSet::new()
-    };
-
-    for track in &mut download.tracks {
-        let normalized = normalize_track_name(&track.name);
-        if completed.contains(&normalized) {
-            track.status = TrackStatus::Done;
-        }
-    }
+    // Completion is determined by the protected download worker,
+    // not by saved progress from earlier download requests.
 
     let log_progress = track_log_progress(app.logs.clone());
     for track in &mut download.tracks {
@@ -2040,6 +2121,7 @@ enum ConfirmPayload {
     StartDownload {
         song: Song,
         selected_tracks: Vec<String>,
+        use_browser: bool,
         intro_click: bool,
         key_shift: i8,
     },
@@ -2303,7 +2385,7 @@ fn update_loading_state(app: &mut App) {
                         app.tracks_state.select(Some(0));
                     }
                     app.current_song = Some(song);
-                    app.intro_click = false;
+                    app.intro_click = true;
                     app.key_shift = 0;
                     app.base_key = details.base_key;
                     app.detail_focus = DetailFocus::Tracks;
@@ -2398,21 +2480,42 @@ fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     }
 
     lines.push(Line::from(""));
-    let yes_style = if confirm.selected == 0 {
-        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
+    let download_confirm =
+        matches!(&confirm.payload, ConfirmPayload::StartDownload { .. });
+
+    let labels: &[&str] = if download_confirm {
+        &[" KEEP EXISTING ", " REPLACE EXISTING ", " CANCEL "]
     } else {
-        Style::default().fg(Color::Green)
+        &[" YES ", " NO "]
     };
-    let no_style = if confirm.selected == 1 {
-        Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Red)
-    };
-    lines.push(Line::from(vec![
-        Span::styled(" YES ", yes_style),
-        Span::raw("   "),
-        Span::styled(" NO ", no_style),
-    ]));
+
+    let mut choices = Vec::new();
+
+    for (index, label) in labels.iter().enumerate() {
+        let color = match (download_confirm, index) {
+            (true, 0) => Color::Green,
+            (true, 1) => Color::Yellow,
+            (_, 0) => Color::Green,
+            _ => Color::Red,
+        };
+
+        let style = if confirm.selected == index {
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+
+        choices.push(Span::styled((*label).to_string(), style));
+
+        if index + 1 < labels.len() {
+            choices.push(Span::raw(" "));
+        }
+    }
+
+    lines.push(Line::from(choices));
 
     let panel = Paragraph::new(Text::from(lines))
         .block(
@@ -2432,18 +2535,54 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
     };
     match key.code {
         KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-            confirm.selected = (confirm.selected + 1) % 2;
+            let count = if matches!(
+                &confirm.payload,
+                ConfirmPayload::StartDownload { .. }
+            ) {
+                3
+            } else {
+                2
+            };
+
+            confirm.selected = match key.code {
+                KeyCode::Left => (confirm.selected + count - 1) % count,
+                _ => (confirm.selected + 1) % count,
+            };
         }
         KeyCode::Esc => {
             app.confirm = None;
         }
         KeyCode::Enter => {
             let confirm = app.confirm.take().unwrap();
-            match confirm.selected {
+
+            let is_download_confirm =
+                matches!(&confirm.payload, ConfirmPayload::StartDownload { .. });
+
+            if is_download_confirm && confirm.selected == 2 {
+                return Ok(false);
+            }
+
+            let file_policy = if is_download_confirm {
+                Some(if confirm.selected == 0 {
+                    tasks::download_song::ExistingFilePolicy::Keep
+                } else {
+                    tasks::download_song::ExistingFilePolicy::Replace
+                })
+            } else {
+                None
+            };
+
+            let action_index = if is_download_confirm {
+                0
+            } else {
+                confirm.selected
+            };
+            match action_index {
                 0 => match confirm.payload {
                     ConfirmPayload::StartDownload {
                         song,
                         selected_tracks,
+                        use_browser,
                         intro_click,
                         key_shift,
                     } => {
@@ -2471,13 +2610,47 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                         let worker_download_dir = download_dir.clone();
                         let handle = std::thread::spawn(move || {
                             let _guard = LogScope::new(logs);
-                            start_download(
+                            let prepared = prepare_staged_download(
                                 &song_url,
+                                use_browser,
                                 intro_click,
                                 key_shift,
                                 selected_tracks,
                                 &worker_download_dir,
-                            )
+                            )?;
+
+                            let mut created = 0usize;
+                            let mut replaced = 0usize;
+                            let mut kept = 0usize;
+
+                            for staged in &prepared.files {
+                                let outcome = tasks::download_song::publish_staged_file(
+                                    staged,
+                                    &worker_download_dir,
+                                    file_policy.ok_or_else(|| anyhow!("Missing download policy"))?,
+                                )?;
+
+                                match outcome {
+                                    tasks::download_song::PublishOutcome::Created => {
+                                        created += 1;
+                                    }
+                                    tasks::download_song::PublishOutcome::Replaced => {
+                                        replaced += 1;
+                                    }
+                                    tasks::download_song::PublishOutcome::KeptExisting => {
+                                        kept += 1;
+                                    }
+                                }
+                            }
+
+                            fs::remove_dir_all(&prepared.staging_dir)?;
+
+                            tracing::info!(
+                                "Protected download: {} new, {} replaced, {} kept",
+                                created, replaced, kept
+                            );
+
+                            Ok(())
                         });
                         app.download = Some(DownloadState {
                             song,

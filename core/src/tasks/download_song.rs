@@ -1711,3 +1711,299 @@ impl<'a> Checkable for Element<'a> {
         }
     }
 }
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExistingFilePolicy {
+    Keep,
+    Replace,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Created,
+    Replaced,
+    KeptExisting,
+}
+
+/// Publish a verified download from staging into the destination folder.
+/// Staging must be on the same filesystem as the destination.
+pub fn publish_staged_file(
+    staged: &std::path::Path,
+    destination_dir: &std::path::Path,
+    policy: ExistingFilePolicy,
+) -> Result<PublishOutcome> {
+    let filename = staged
+        .file_name()
+        .ok_or_else(|| anyhow!("Staged file has no filename"))?;
+
+    let metadata = std::fs::metadata(staged)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(anyhow!("Staged file is empty or invalid"));
+    }
+
+    let destination = destination_dir.join(filename);
+    let existed = destination.exists();
+
+    if existed {
+        if !destination.is_file() {
+            return Err(anyhow!("Destination is not a file"));
+        }
+
+        if policy == ExistingFilePolicy::Keep {
+            return Ok(PublishOutcome::KeptExisting);
+        }
+    }
+
+    std::fs::rename(staged, &destination)?;
+
+    if existed {
+        Ok(PublishOutcome::Replaced)
+    } else {
+        Ok(PublishOutcome::Created)
+    }
+}
+
+#[cfg(test)]
+mod safe_publish_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn safe_publish_preserves_and_replaces_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "kv-safe-publish-{}-{unique}",
+            std::process::id()
+        ));
+
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let source = staging.join("Bass.mp3");
+        let target = destination.join("Bass.mp3");
+
+        fs::write(&target, b"user edited version").unwrap();
+        fs::write(&source, b"fresh download").unwrap();
+
+        assert_eq!(
+            publish_staged_file(
+                &source,
+                &destination,
+                ExistingFilePolicy::Keep
+            ).unwrap(),
+            PublishOutcome::KeptExisting
+        );
+
+        assert_eq!(fs::read(&target).unwrap(), b"user edited version");
+
+        assert_eq!(
+            publish_staged_file(
+                &source,
+                &destination,
+                ExistingFilePolicy::Replace
+            ).unwrap(),
+            PublishOutcome::Replaced
+        );
+
+        assert_eq!(fs::read(&target).unwrap(), b"fresh download");
+
+        let new_source = staging.join("Drums.mp3");
+        fs::write(&new_source, b"new drums").unwrap();
+
+        assert_eq!(
+            publish_staged_file(
+                &new_source,
+                &destination,
+                ExistingFilePolicy::Keep
+            ).unwrap(),
+            PublishOutcome::Created
+        );
+
+        assert_eq!(
+            fs::read(destination.join("Drums.mp3")).unwrap(),
+            b"new drums"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+/// Create a unique staging directory on the destination filesystem.
+pub fn create_download_staging_dir(
+    destination_dir: &std::path::Path,
+) -> Result<PathBuf> {
+    if !destination_dir.is_dir() {
+        return Err(anyhow!(
+            "Download destination does not exist: {}",
+            destination_dir.display()
+        ));
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_nanos();
+
+    for attempt in 0..32 {
+        let name = format!(
+            ".kvui-staging-{}-{timestamp}-{attempt}",
+            std::process::id()
+        );
+        let path = destination_dir.join(name);
+
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(anyhow!("Could not create a unique staging directory"))
+}
+
+#[cfg(test)]
+mod download_staging_tests {
+    use super::create_download_staging_dir;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn staging_directory_is_inside_destination() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "kv-staging-test-{}-{unique}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        let staging = create_download_staging_dir(&root).unwrap();
+
+        assert!(staging.is_dir());
+        assert_eq!(staging.parent(), Some(root.as_path()));
+
+        fs::write(staging.join("Bass.mp3"), b"test data").unwrap();
+
+        // A staged file must not appear in the destination itself.
+        assert!(!root.join("Bass.mp3").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+/// Verify that staging contains exactly one nonempty MP3 per selected track.
+pub fn verify_staged_tracks(
+    staging_dir: &std::path::Path,
+    selected_tracks: &[String],
+) -> Result<Vec<PathBuf>> {
+    if selected_tracks.is_empty() {
+        return Err(anyhow!("No tracks selected"));
+    }
+
+    let mut files = Vec::new();
+
+    for entry in std::fs::read_dir(staging_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if name.to_ascii_lowercase().ends_with(".crdownload") {
+            return Err(anyhow!("Incomplete Chromium download: {}", name));
+        }
+
+        if path.is_file()
+            && path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("mp3"))
+        {
+            if entry.metadata()?.len() == 0 {
+                return Err(anyhow!("Empty download: {}", name));
+            }
+            files.push(path);
+        }
+    }
+
+    if files.len() != selected_tracks.len() {
+        return Err(anyhow!(
+            "Expected {} tracks but found {} MP3 files",
+            selected_tracks.len(),
+            files.len()
+        ));
+    }
+
+    for track in selected_tracks {
+        let matches = files.iter().filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| browser_filename_matches_track(name, track))
+        }).count();
+
+        if matches != 1 {
+            return Err(anyhow!(
+                "Expected exactly one MP3 for '{}'; found {}",
+                track,
+                matches
+            ));
+        }
+    }
+
+    Ok(files)
+}
+
+#[cfg(test)]
+mod staged_track_verification_tests {
+    use super::verify_staged_tracks;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn verifies_requested_staged_tracks() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir = std::env::temp_dir().join(format!(
+            "kv-verify-staging-{}-{unique}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let filename =
+            "Don_Henley_Dirty_Laundry(Synth_Bass_Custom_Backing_Track).mp3";
+
+        fs::write(dir.join(filename), b"test audio").unwrap();
+
+        let bass = vec!["Synth Bass".to_string()];
+        let drums = vec!["Drums".to_string()];
+
+        assert_eq!(
+            verify_staged_tracks(&dir, &bass).unwrap().len(),
+            1
+        );
+
+        assert!(verify_staged_tracks(&dir, &drums).is_err());
+
+        fs::write(dir.join("unfinished.crdownload"), b"partial").unwrap();
+        assert!(verify_staged_tracks(&dir, &bass).is_err());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
