@@ -120,6 +120,13 @@ struct App {
     loading: Option<LoadingState>,
     spinner_index: usize,
     confirm: Option<ConfirmState>,
+    incomplete_folders: Vec<PathBuf>,
+    recovery_notice_open: bool,
+    recovery_selected: usize,
+    recovery_details_open: bool,
+    recovery_cleanup_confirm_open: bool,
+    recovery_cleanup_selected: usize,
+    recovery_detail_scroll: usize,
     done_menu_items: Vec<String>,
     done_menu_index: usize,
 }
@@ -155,6 +162,13 @@ impl App {
             loading: None,
             spinner_index: 0,
             confirm: None,
+            incomplete_folders: Vec::new(),
+            recovery_notice_open: false,
+            recovery_selected: 1,
+            recovery_details_open: false,
+            recovery_cleanup_confirm_open: false,
+            recovery_cleanup_selected: 1,
+            recovery_detail_scroll: 0,
             done_menu_items: vec![
                 "Open in File Explorer".to_string(),
                 "Back to Songs".to_string(),
@@ -166,6 +180,49 @@ impl App {
         app
     }
 
+    /// Identify incomplete downloads without modifying files.
+    fn scan_incomplete_downloads(&mut self) {
+        self.incomplete_folders.clear();
+
+        if !self.download_dir.is_dir() {
+            return;
+        }
+
+        match tasks::download_song::list_kvui_staging_directories(
+            &self.download_dir,
+        ) {
+            Ok(folders) => {
+                for folder in folders {
+                    match tasks::download_song::kvui_staging_activity(&folder) {
+                        Ok(tasks::download_song::KvuiStagingActivity::Active) => {}
+                        Ok(tasks::download_song::KvuiStagingActivity::Abandoned)
+                        | Ok(tasks::download_song::KvuiStagingActivity::Legacy) => {
+                            self.incomplete_folders.push(folder);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Could not inspect staging folder {}: {}",
+                                folder.display(),
+                                err
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Could not scan download folder {}: {}",
+                    self.download_dir.display(),
+                    err
+                );
+            }
+        }
+
+        tracing::info!(
+            "Incomplete download folders found: {}",
+            self.incomplete_folders.len()
+        );
+    }
     fn refresh_menu(&mut self) {
         let authenticated = is_authenticated();
         self.menu_items = if authenticated {
@@ -189,6 +246,19 @@ impl App {
                 "Quit".to_string(),
             ]
         };
+        if !self.incomplete_folders.is_empty() {
+            let label = format!(
+                "Incomplete Downloads ({})",
+                self.incomplete_folders.len()
+            );
+
+            let position = self.menu_items
+                .iter()
+                .position(|item| item == "Quit")
+                .unwrap_or(self.menu_items.len());
+
+            self.menu_items.insert(position, label);
+        }
         self.menu_index = 0;
     }
 }
@@ -397,6 +467,11 @@ fn run_tui(diagnostics_path: Option<PathBuf>, demo_screen: Option<DemoScreen>) -
     let tick_rate = Duration::from_millis(80);
     let mut last_tick = Instant::now();
     let mut app = App::new(logs);
+    if demo_screen.is_none() {
+        app.scan_incomplete_downloads();
+        app.refresh_menu();
+        app.recovery_notice_open = !app.incomplete_folders.is_empty();
+    }
     if let Some(screen) = demo_screen {
         configure_demo_screen(&mut app, screen);
     }
@@ -458,6 +533,9 @@ fn handle_key_event(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
+    if app.recovery_notice_open {
+        return handle_recovery_keys(app, key);
+    }
     if app.confirm.is_some() {
         return handle_confirm_keys(app, key);
     }
@@ -495,6 +573,22 @@ fn handle_menu_keys(
                 .cloned()
                 .unwrap_or_default();
             match selected.as_str() {
+                item if item.starts_with("Incomplete Downloads (") => {
+                    app.scan_incomplete_downloads();
+                    app.refresh_menu();
+
+                    if app.incomplete_folders.is_empty() {
+                        app.status =
+                            "No incomplete downloads remain.".to_string();
+                    } else {
+                        app.recovery_selected = 1;
+                        app.recovery_details_open = false;
+                        app.recovery_detail_scroll = 0;
+                        app.recovery_cleanup_confirm_open = false;
+                        app.recovery_cleanup_selected = 1;
+                        app.recovery_notice_open = true;
+                    }
+                }
                 "Login" => {
                     app.status = "".to_string();
                     restore_terminal(terminal)?;
@@ -869,6 +963,9 @@ fn ui(frame: &mut ratatui::Frame, app: &mut App) {
     }
     if app.confirm.is_some() {
         render_confirm_overlay(frame, app);
+    }
+    if app.recovery_notice_open {
+        render_recovery_overlay(frame, app);
     }
 }
 
@@ -1485,6 +1582,7 @@ fn start_download(
 struct PreparedDownload {
     staging_dir: PathBuf,
     files: Vec<PathBuf>,
+    lock_file: File,
 }
 
 /// Prepare and verify downloads without changing destination files.
@@ -1499,6 +1597,9 @@ fn prepare_staged_download(
 ) -> Result<PreparedDownload> {
     let staging_dir =
         tasks::download_song::create_download_staging_dir(destination_dir)?;
+
+    let lock_file =
+        tasks::download_song::lock_new_kvui_staging_directory(&staging_dir)?;
 
     let result = (|| -> Result<Vec<PathBuf>> {
         kv_core::download_progress::DownloadProgress::new()
@@ -1523,15 +1624,14 @@ fn prepare_staged_download(
         Ok(files) => Ok(PreparedDownload {
             staging_dir,
             files,
+            lock_file,
         }),
         Err(err) => {
-            if let Err(cleanup_error) = fs::remove_dir_all(&staging_dir) {
-                tracing::warn!(
-                    "Could not clean up staging folder {}: {}",
-                    staging_dir.display(),
-                    cleanup_error
-                );
-            }
+            tracing::warn!(
+                "Incomplete download retained in {}: {}",
+                staging_dir.display(),
+                err
+            );
             Err(err)
         }
     }
@@ -2463,6 +2563,203 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     vertical[1]
 }
 
+fn render_recovery_overlay(frame: &mut ratatui::Frame, app: &App) {
+    if app.recovery_cleanup_confirm_open {
+        render_recovery_cleanup_confirmation(frame, app);
+        return;
+    }
+    if app.recovery_details_open {
+        render_recovery_details_overlay(frame, app);
+        return;
+    }
+    if !app.recovery_notice_open {
+        return;
+    }
+
+    let area = centered_rect(85, 60, frame.size());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(
+            "KVUI found temporary files left by an interrupted download."
+        ).alignment(Alignment::Center),
+        Line::from(""),
+        Line::from(format!(
+            "  Incomplete folders found: {}",
+            app.incomplete_folders.len()
+        )),
+        Line::from(""),
+        Line::from(
+            "  Cleaning these files will not affect any completed downloads."
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Options:",
+            Style::default().remove_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    let options = [
+        ("Clean Up", "Removes the abandoned temp folder and files"),
+        ("Remind Me Later", "Continue using KVUI"),
+        ("View Details", "See the files, sizes, and location"),
+    ];
+
+    for (index, (label, description)) in options.iter().enumerate() {
+        let text = format!("    {} - {}", label, description);
+
+        let style = if app.recovery_selected == index {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .remove_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).remove_modifier(Modifier::BOLD)
+        };
+
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    let panel = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title("Incomplete Download Found")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(panel, area);
+}
+fn render_recovery_cleanup_confirmation(
+    frame: &mut ratatui::Frame,
+    app: &App,
+) {
+    let area = centered_rect(80, 50, frame.size());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from("Remove abandoned temporary download files?"),
+        Line::from(""),
+        Line::from(format!(
+            "Incomplete folders detected: {}",
+            app.incomplete_folders.len()
+        )),
+        Line::from(""),
+        Line::from("Only verified, unlocked staging folders are eligible."),
+        Line::from("Active downloads and legacy folders will be preserved."),
+        Line::from("Completed downloads will not be removed."),
+        Line::from(""),
+        Line::from("Yes permanently removes eligible temporary files."),
+        Line::from(""),
+    ];
+
+    let choices = [
+        "Yes - Clean Up",
+        "No - Keep Files",
+    ];
+
+    for (index, choice) in choices.iter().enumerate() {
+        let style = if app.recovery_cleanup_selected == index {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        lines.push(Line::from(Span::styled(
+            format!("  {choice}  "),
+            style,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Esc: Cancel"));
+
+    let panel = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title("Confirm Temporary File Cleanup")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(panel, area);
+}
+fn render_recovery_details_overlay(frame: &mut ratatui::Frame, app: &App) {
+    let area = centered_rect(92, 80, frame.size());
+    frame.render_widget(Clear, area);
+
+    let mut lines = vec![
+        Line::from("Temporary files from interrupted downloads"),
+        Line::from(""),
+    ];
+
+    for folder in &app.incomplete_folders {
+        lines.push(Line::from(format!(
+            "Folder: {}",
+            folder.display()
+        )));
+
+        match tasks::download_song::inspect_kvui_staging_directory(folder) {
+            Ok(items) => {
+                if items.is_empty() {
+                    lines.push(Line::from("  (empty folder)"));
+                }
+
+                for item in items {
+                    let kind = if item.is_directory {
+                        "[DIR]"
+                    } else {
+                        "[FILE]"
+                    };
+
+                    let size = item.size_bytes
+                        .map(|bytes| format!("{bytes} bytes"))
+                        .unwrap_or_else(|| "size unavailable".to_string());
+
+                    lines.push(Line::from(format!(
+                        "  {} {} - {}",
+                        kind, item.name, size
+                    )));
+                }
+            }
+            Err(err) => {
+                lines.push(Line::from(format!(
+                    "  Could not inspect folder: {err}"
+                )));
+            }
+        }
+
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(
+        "Up/Down: Scroll | PgUp/PgDn: Scroll | Esc: Return"
+    ));
+
+    let scroll = app.recovery_detail_scroll
+        .min(u16::MAX as usize) as u16;
+
+    let panel = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title("Incomplete Download Details")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    frame.render_widget(panel, area);
+}
 fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     let Some(confirm) = &app.confirm else {
         return;
@@ -2529,6 +2826,149 @@ fn render_confirm_overlay(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(panel, area);
 }
 
+/// Handle incomplete-download recovery navigation.
+/// File cleanup and details are not connected yet.
+/// Perform cleanup only after explicit confirmation.
+/// Individual failures do not stop checks of other staging folders.
+fn run_confirmed_recovery_cleanup(app: &mut App) {
+    use tasks::download_song::{
+        cleanup_kvui_staging_directory,
+        KvuiCleanupResult,
+    };
+
+    let folders = app.incomplete_folders.clone();
+    let mut removed = 0usize;
+    let mut active = 0usize;
+    let mut legacy = 0usize;
+    let mut unsafe_count = 0usize;
+    let mut errors = 0usize;
+
+    for folder in folders {
+        match cleanup_kvui_staging_directory(&app.download_dir, &folder) {
+            Ok(KvuiCleanupResult::Removed) => {
+                removed += 1;
+            }
+            Ok(KvuiCleanupResult::SkippedActive) => {
+                active += 1;
+            }
+            Ok(KvuiCleanupResult::SkippedLegacy) => {
+                legacy += 1;
+            }
+            Ok(KvuiCleanupResult::SkippedUnsafe) => {
+                unsafe_count += 1;
+            }
+            Err(err) => {
+                errors += 1;
+                tracing::warn!(
+                    "Could not clean staging folder {}: {}",
+                    folder.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    app.scan_incomplete_downloads();
+    app.refresh_menu();
+
+    app.recovery_cleanup_confirm_open = false;
+    app.recovery_notice_open = false;
+    app.recovery_details_open = false;
+    app.recovery_selected = 1;
+
+    app.status = format!(
+        "Cleanup: {} removed; {} legacy, {} active, {} unsafe preserved; {} errors. {} incomplete folders remain.",
+        removed,
+        legacy,
+        active,
+        unsafe_count,
+        errors,
+        app.incomplete_folders.len()
+    );
+}
+fn handle_recovery_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if app.recovery_details_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                app.recovery_details_open = false;
+            }
+            KeyCode::Up => {
+                app.recovery_detail_scroll =
+                    app.recovery_detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.recovery_detail_scroll =
+                    app.recovery_detail_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.recovery_detail_scroll =
+                    app.recovery_detail_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                app.recovery_detail_scroll =
+                    app.recovery_detail_scroll.saturating_add(10);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if app.recovery_cleanup_confirm_open {
+        match key.code {
+            KeyCode::Left | KeyCode::Up => {
+                app.recovery_cleanup_selected = 0;
+            }
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                app.recovery_cleanup_selected =
+                    (app.recovery_cleanup_selected + 1) % 2;
+            }
+            KeyCode::Esc | KeyCode::Backspace => {
+                app.recovery_cleanup_confirm_open = false;
+            }
+            KeyCode::Enter => {
+                if app.recovery_cleanup_selected == 1 {
+                    // No - Keep Files.
+                    app.recovery_cleanup_confirm_open = false;
+                } else {
+                    run_confirmed_recovery_cleanup(app);
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Up | KeyCode::Left => {
+            app.recovery_selected =
+                (app.recovery_selected + 2) % 3;
+        }
+        KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+            app.recovery_selected =
+                (app.recovery_selected + 1) % 3;
+        }
+        KeyCode::Esc => {
+            app.recovery_notice_open = false;
+        }
+        KeyCode::Enter => {
+            if app.recovery_selected == 1 {
+                // Remind Me Later.
+                app.recovery_notice_open = false;
+            }
+            if app.recovery_selected == 2 {
+                app.recovery_details_open = true;
+                app.recovery_detail_scroll = 0;
+            }
+            if app.recovery_selected == 0 {
+                app.recovery_cleanup_confirm_open = true;
+                app.recovery_cleanup_selected = 1;
+            }
+            // Actual cleanup is not connected yet.
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
 fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
     let Some(confirm) = &mut app.confirm else {
         return Ok(false);
@@ -2643,6 +3083,8 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                                 }
                             }
 
+                            // Release the active lock before deleting its file.
+                            drop(prepared.lock_file);
                             fs::remove_dir_all(&prepared.staging_dir)?;
 
                             tracing::info!(

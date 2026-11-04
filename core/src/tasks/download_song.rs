@@ -2007,3 +2007,597 @@ mod staged_track_verification_tests {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+
+/// List KVUI staging folders without modifying their contents.
+/// This function does not determine whether a folder is active.
+pub fn list_kvui_staging_directories(
+    destination_dir: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>> {
+    let mut folders = Vec::new();
+
+    for item in std::fs::read_dir(destination_dir)? {
+        let entry = item?;
+
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str() else {
+            continue;
+        };
+
+        let Some(suffix) = name.strip_prefix(".kvui-staging-") else {
+            continue;
+        };
+
+        let parts: Vec<&str> = suffix.split('-').collect();
+
+        if parts.len() != 3
+            || parts[0].parse::<u32>().is_err()
+            || parts[1].parse::<u128>().is_err()
+            || parts[2].parse::<u32>().is_err()
+        {
+            continue;
+        }
+
+        folders.push(entry.path());
+    }
+
+    folders.sort();
+    Ok(folders)
+}
+
+#[cfg(test)]
+mod staging_discovery_tests {
+    use super::list_kvui_staging_directories;
+    use std::fs;
+
+    #[test]
+    fn lists_only_kvui_staging_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        let staging = root.join(".kvui-staging-123-456789-0");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(root.join("MySong")).unwrap();
+        fs::create_dir(root.join(".kvui-staging-invalid")).unwrap();
+
+        fs::write(staging.join("Drum.mp3"), b"test").unwrap();
+
+        let found = list_kvui_staging_directories(&root).unwrap();
+
+        assert_eq!(found, vec![staging.clone()]);
+        assert!(staging.join("Drum.mp3").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+/// Information displayed when inspecting an incomplete download.
+#[derive(Debug, PartialEq, Eq)]
+pub struct KvuiStagingItem {
+    pub name: String,
+    pub size_bytes: Option<u64>,
+    pub is_directory: bool,
+}
+
+/// Inspect temporary download contents without changing anything.
+pub fn inspect_kvui_staging_directory(
+    folder: &std::path::Path,
+) -> Result<Vec<KvuiStagingItem>> {
+    let mut items = Vec::new();
+
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+
+        let size_bytes = if kind.is_file() {
+            Some(entry.metadata()?.len())
+        } else {
+            None
+        };
+
+        items.push(KvuiStagingItem {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            size_bytes,
+            is_directory: kind.is_dir(),
+        });
+    }
+
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(items)
+}
+
+#[cfg(test)]
+mod staging_details_tests {
+    use super::inspect_kvui_staging_directory;
+    use std::fs;
+
+    #[test]
+    fn inspects_staging_contents_without_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-details-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        let track = root.join("Drum.mp3");
+        fs::write(&track, b"test audio").unwrap();
+        fs::create_dir(root.join("extra")).unwrap();
+
+        let items = inspect_kvui_staging_directory(&root).unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "Drum.mp3");
+        assert_eq!(items[0].size_bytes, Some(10));
+        assert!(!items[0].is_directory);
+        assert_eq!(items[1].name, "extra");
+        assert!(items[1].is_directory);
+
+        // Inspection must leave the files untouched.
+        assert!(track.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod staging_lock_tests {
+    use std::fs::{self, File, OpenOptions, TryLockError};
+
+    #[test]
+    fn staging_lock_blocks_second_handle() {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        let path = root.join(".kvui-active.lock");
+
+        let first = File::create(&path).unwrap();
+        first.lock().unwrap();
+
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        assert!(matches!(
+            second.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+
+        first.unlock().unwrap();
+
+        second.try_lock().unwrap();
+        second.unlock().unwrap();
+
+        drop(first);
+        drop(second);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+/// Lock filename used to identify active KVUI staging folders.
+pub const KVUI_STAGING_LOCK_FILE: &str = ".kvui-active.lock";
+
+/// Create and lock a marker inside a newly created staging folder.
+/// The returned File must remain open until the download and
+/// publication process has finished.
+pub fn lock_new_kvui_staging_directory(
+    staging_dir: &std::path::Path,
+) -> Result<std::fs::File> {
+    if !staging_dir.is_dir() {
+        return Err(anyhow!("Staging directory does not exist"));
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(staging_dir.join(KVUI_STAGING_LOCK_FILE))?;
+
+    file.lock()?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod new_staging_lock_tests {
+    use super::{
+        lock_new_kvui_staging_directory,
+        KVUI_STAGING_LOCK_FILE,
+    };
+    use std::fs::{self, OpenOptions, TryLockError};
+
+    #[test]
+    fn new_staging_lock_is_exclusive() {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-new-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        let first = lock_new_kvui_staging_directory(&root).unwrap();
+
+        let lock_path = root.join(KVUI_STAGING_LOCK_FILE);
+        assert!(lock_path.exists());
+
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+
+        assert!(matches!(
+            second.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+
+        drop(first);
+
+        second.try_lock().unwrap();
+        second.unlock().unwrap();
+
+        drop(second);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+/// The observed state of a KVUI staging folder.
+/// Legacy folders have no lock marker and require special care.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvuiStagingActivity {
+    Active,
+    Abandoned,
+    Legacy,
+}
+
+/// Read-only staging activity check.
+/// Cleanup must acquire the lock again immediately before deletion.
+pub fn kvui_staging_activity(
+    folder: &std::path::Path,
+) -> Result<KvuiStagingActivity> {
+    let lock_path = folder.join(KVUI_STAGING_LOCK_FILE);
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(KvuiStagingActivity::Legacy);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    match file.try_lock() {
+        Ok(()) => {
+            file.unlock()?;
+            Ok(KvuiStagingActivity::Abandoned)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Ok(KvuiStagingActivity::Active)
+        }
+        Err(err) => Err(anyhow!("Cannot inspect staging lock: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod staging_activity_tests {
+    use super::{
+        kvui_staging_activity,
+        lock_new_kvui_staging_directory,
+        KvuiStagingActivity,
+    };
+    use std::fs;
+
+    #[test]
+    fn distinguishes_active_abandoned_and_legacy_staging() {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-activity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(
+            kvui_staging_activity(&root).unwrap(),
+            KvuiStagingActivity::Legacy
+        );
+
+        let active_lock =
+            lock_new_kvui_staging_directory(&root).unwrap();
+
+        assert_eq!(
+            kvui_staging_activity(&root).unwrap(),
+            KvuiStagingActivity::Active
+        );
+
+        drop(active_lock);
+
+        assert_eq!(
+            kvui_staging_activity(&root).unwrap(),
+            KvuiStagingActivity::Abandoned
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+/// Result of a deliberately requested cleanup attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvuiCleanupResult {
+    Removed,
+    SkippedActive,
+    SkippedLegacy,
+    SkippedUnsafe,
+}
+
+fn kvui_cleanup_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Clean one abandoned, lock-protected staging folder.
+///
+/// Legacy folders and active downloads are never deleted.
+/// The caller must obtain explicit user confirmation before calling.
+pub fn cleanup_kvui_staging_directory(
+    destination_dir: &std::path::Path,
+    folder: &std::path::Path,
+) -> Result<KvuiCleanupResult> {
+    use std::fs;
+
+    // Only accept folders recognized by KVUI's staging-name parser.
+    let recognized = list_kvui_staging_directories(destination_dir)?
+        .iter()
+        .any(|candidate| candidate == folder);
+
+    if !recognized {
+        return Ok(KvuiCleanupResult::SkippedUnsafe);
+    }
+
+    let folder_metadata = fs::symlink_metadata(folder)?;
+    if !folder_metadata.is_dir()
+        || kvui_cleanup_reparse_point(&folder_metadata)
+    {
+        return Ok(KvuiCleanupResult::SkippedUnsafe);
+    }
+
+    // Canonical paths must confirm this is an immediate child.
+    let root = fs::canonicalize(destination_dir)?;
+    let actual_folder = fs::canonicalize(folder)?;
+
+    if actual_folder.parent() != Some(root.as_path()) {
+        return Ok(KvuiCleanupResult::SkippedUnsafe);
+    }
+
+    let lock_path = folder.join(KVUI_STAGING_LOCK_FILE);
+
+    let lock_metadata = match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(KvuiCleanupResult::SkippedLegacy);
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if !lock_metadata.is_file()
+        || kvui_cleanup_reparse_point(&lock_metadata)
+    {
+        return Ok(KvuiCleanupResult::SkippedUnsafe);
+    }
+
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+
+    // Acquire the lock again immediately before deletion.
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Ok(KvuiCleanupResult::SkippedActive);
+        }
+        Err(err) => {
+            return Err(anyhow!("Cannot acquire staging cleanup lock: {err}"));
+        }
+    }
+
+    // Validate the target again while holding the lock.
+    let current_metadata = fs::symlink_metadata(folder)?;
+    if !current_metadata.is_dir()
+        || kvui_cleanup_reparse_point(&current_metadata)
+        || fs::canonicalize(folder)? != actual_folder
+    {
+        return Ok(KvuiCleanupResult::SkippedUnsafe);
+    }
+
+    // Inspect everything before removing anything.
+    // Nested folders, links and unusual filesystem objects require
+    // manual review rather than recursive deletion.
+    let mut removable_files = Vec::new();
+
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+
+        if !metadata.is_file()
+            || kvui_cleanup_reparse_point(&metadata)
+        {
+            return Ok(KvuiCleanupResult::SkippedUnsafe);
+        }
+
+        if entry.file_name() != std::ffi::OsStr::new(KVUI_STAGING_LOCK_FILE) {
+            removable_files.push(path);
+        }
+    }
+
+    // The download lock remains held while ordinary files are removed.
+    for path in removable_files {
+        fs::remove_file(path)?;
+    }
+
+    // Release the lock before removing its marker, for Windows.
+    lock.unlock()?;
+    drop(lock);
+
+    fs::remove_file(&lock_path)?;
+    fs::remove_dir(folder)?;
+
+    Ok(KvuiCleanupResult::Removed)
+}
+
+#[cfg(test)]
+mod staging_cleanup_tests {
+    use super::{
+        cleanup_kvui_staging_directory,
+        lock_new_kvui_staging_directory,
+        KvuiCleanupResult,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn test_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "kvui-cleanup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn removes_abandoned_staging_but_preserves_completed_files() {
+        let root = test_root();
+        let finished = root.join("Completed.mp3");
+        fs::write(&finished, b"finished recording").unwrap();
+
+        let staging = root.join(".kvui-staging-123-456789-0");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("Partial.mp3"), b"partial").unwrap();
+
+        let lock = lock_new_kvui_staging_directory(&staging).unwrap();
+        drop(lock);
+
+        assert_eq!(
+            cleanup_kvui_staging_directory(&root, &staging).unwrap(),
+            KvuiCleanupResult::Removed
+        );
+
+        assert!(!staging.exists());
+        assert_eq!(fs::read(&finished).unwrap(), b"finished recording");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_active_and_legacy_staging() {
+        let root = test_root();
+
+        let active = root.join(".kvui-staging-123-456789-0");
+        fs::create_dir(&active).unwrap();
+        let held_lock = lock_new_kvui_staging_directory(&active).unwrap();
+
+        assert_eq!(
+            cleanup_kvui_staging_directory(&root, &active).unwrap(),
+            KvuiCleanupResult::SkippedActive
+        );
+        assert!(active.exists());
+
+        let legacy = root.join(".kvui-staging-123-456790-0");
+        fs::create_dir(&legacy).unwrap();
+
+        assert_eq!(
+            cleanup_kvui_staging_directory(&root, &legacy).unwrap(),
+            KvuiCleanupResult::SkippedLegacy
+        );
+        assert!(legacy.exists());
+
+        drop(held_lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_unexpected_nested_folders_and_invalid_names() {
+        let root = test_root();
+
+        let staging = root.join(".kvui-staging-123-456789-0");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(staging.join("unexpected")).unwrap();
+
+        let lock = lock_new_kvui_staging_directory(&staging).unwrap();
+        drop(lock);
+
+        assert_eq!(
+            cleanup_kvui_staging_directory(&root, &staging).unwrap(),
+            KvuiCleanupResult::SkippedUnsafe
+        );
+        assert!(staging.join("unexpected").exists());
+
+        let unrelated = root.join("CompletedSong");
+        fs::create_dir(&unrelated).unwrap();
+
+        assert_eq!(
+            cleanup_kvui_staging_directory(&root, &unrelated).unwrap(),
+            KvuiCleanupResult::SkippedUnsafe
+        );
+        assert!(unrelated.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
