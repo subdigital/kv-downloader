@@ -3051,11 +3051,12 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                         }
                         let song_destination = match (|| -> Result<PathBuf> {
                             kvui_check_destination_directory(&download_dir)?;
-                            kvui_select_song_destination(
+                            kvui_select_keyed_song_destination(
                                 &download_dir,
                                 &song.artist,
                                 &song.title,
                                 &song.url,
+                                key_shift,
                             )
                         })() {
                             Ok(path) => path,
@@ -3090,11 +3091,12 @@ fn handle_confirm_keys(app: &mut App, key: KeyEvent) -> Result<bool> {
                                 &worker_download_dir,
                             )?;
 
-                            kvui_prepare_song_destination(
+                            kvui_prepare_keyed_song_destination(
                                 &worker_download_dir,
                                 &song_artist,
                                 &song_title,
                                 &song_url,
+                                key_shift,
                                 &worker_song_destination,
                             )?;
                             let mut created = 0usize;
@@ -3572,6 +3574,45 @@ mod artist_song_folder_names {
 /// Construct an Artist/Song destination under the selected download root.
 /// Does not create directories or modify files.
 #[allow(dead_code)]
+/// Build a song-folder name for the selected transposition.
+/// Does not access or modify the filesystem.
+#[allow(dead_code)]
+fn kvui_keyed_song_folder_name(
+    title: &str,
+    transpose: i8,
+) -> Result<String> {
+    if !(-4..=4).contains(&transpose) {
+        return Err(anyhow!("Unsupported key adjustment: {transpose}"));
+    }
+
+    let base = kvui_safe_folder_component(title)?;
+
+    if transpose == 0 {
+        return Ok(base);
+    }
+
+    let suffix = if transpose > 0 {
+        format!("+{transpose}")
+    } else {
+        transpose.to_string()
+    };
+
+    // Preserve the existing 100-character folder-name limit.
+    let max_base_length = 100 - suffix.chars().count();
+
+    let prefix: String = base
+        .chars()
+        .take(max_base_length)
+        .collect();
+
+    let prefix = prefix.trim_end_matches([' ', '.']);
+
+    if prefix.is_empty() {
+        return Err(anyhow!("Song title is empty after shortening"));
+    }
+
+    Ok(format!("{prefix}{suffix}"))
+}
 fn kvui_song_destination_dir(
     download_root: &Path,
     artist: &str,
@@ -4297,5 +4338,291 @@ mod artist_song_publish_integration_tests {
         assert!(!staged_file.exists());
 
         fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod keyed_song_folder_tests {
+    use super::kvui_keyed_song_folder_name;
+
+    #[test]
+    fn original_key_keeps_song_title() {
+        assert_eq!(
+            kvui_keyed_song_folder_name("Hotel California", 0).unwrap(),
+            "Hotel California"
+        );
+    }
+
+    #[test]
+    fn negative_shifts_get_minus_suffix() {
+        for shift in -4..=-1 {
+            assert_eq!(
+                kvui_keyed_song_folder_name("Hotel California", shift).unwrap(),
+                format!("Hotel California{shift}")
+            );
+        }
+    }
+
+    #[test]
+    fn positive_shifts_get_plus_suffix() {
+        for shift in 1..=4 {
+            assert_eq!(
+                kvui_keyed_song_folder_name("Hotel California", shift).unwrap(),
+                format!("Hotel California+{shift}")
+            );
+        }
+    }
+
+    #[test]
+    fn sanitizes_song_title_before_appending_key() {
+        assert_eq!(
+            kvui_keyed_song_folder_name("Who: Me?", -2).unwrap(),
+            "Who_ Me_-2"
+        );
+    }
+
+    #[test]
+    fn preserves_folder_length_limit() {
+        let title = "A".repeat(100);
+
+        let result =
+            kvui_keyed_song_folder_name(&title, -2).unwrap();
+
+        assert_eq!(result.chars().count(), 100);
+        assert!(result.ends_with("-2"));
+    }
+
+    #[test]
+    fn rejects_invalid_titles_and_key_adjustments() {
+        assert!(kvui_keyed_song_folder_name("", -2).is_err());
+        assert!(kvui_keyed_song_folder_name("...", 2).is_err());
+        assert!(kvui_keyed_song_folder_name("Song", -5).is_err());
+        assert!(kvui_keyed_song_folder_name("Song", 5).is_err());
+    }
+}
+
+/// Select a key-specific destination without changing files.
+#[allow(dead_code)]
+fn kvui_select_keyed_song_destination(
+    root: &Path,
+    artist: &str,
+    title: &str,
+    url: &str,
+    transpose: i8,
+) -> Result<PathBuf> {
+    if transpose == 0 {
+        return kvui_select_song_destination(
+            root, artist, title, url
+        );
+    }
+
+    let keyed_title =
+        kvui_keyed_song_folder_name(title, transpose)?;
+
+    kvui_select_song_destination(
+        root, artist, &keyed_title, url
+    )
+}
+
+/// Prepare the selected destination after staging verification.
+#[allow(dead_code)]
+fn kvui_prepare_keyed_song_destination(
+    root: &Path,
+    artist: &str,
+    title: &str,
+    url: &str,
+    transpose: i8,
+    expected: &Path,
+) -> Result<()> {
+    if transpose == 0 {
+        return kvui_prepare_song_destination(
+            root, artist, title, url, expected
+        );
+    }
+
+    let keyed_title =
+        kvui_keyed_song_folder_name(title, transpose)?;
+
+    kvui_prepare_song_destination(
+        root, artist, &keyed_title, url, expected
+    )
+}
+
+#[cfg(test)]
+mod keyed_song_destination_tests {
+    use super::{
+        kvui_select_keyed_song_destination,
+        kvui_prepare_keyed_song_destination,
+        KVUI_SONG_SOURCE_FILE,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const URL: &str = "https://example.test/recording/123";
+
+    // Counter prevents collisions between parallel tests.
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_root() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let sequence =
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+
+        let root = std::env::temp_dir().join(format!(
+            "kvui-c20-routing-{}-{stamp}-{sequence}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    fn select(root: &PathBuf, shift: i8) -> PathBuf {
+        kvui_select_keyed_song_destination(
+            root, "Eagles", "Hotel California", URL, shift
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn selects_distinct_folders_for_each_key() {
+        let root = temporary_root();
+
+        let original = select(&root, 0);
+        let minus_two = select(&root, -2);
+        let plus_two = select(&root, 2);
+
+        assert_eq!(
+            original,
+            root.join("Eagles").join("Hotel California")
+        );
+        assert_eq!(
+            minus_two,
+            root.join("Eagles").join("Hotel California-2")
+        );
+        assert_eq!(
+            plus_two,
+            root.join("Eagles").join("Hotel California+2")
+        );
+
+        assert!(!original.exists());
+        assert!(!minus_two.exists());
+        assert!(!plus_two.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepares_and_reuses_matching_key_folder() {
+        let root = temporary_root();
+        let destination = select(&root, -2);
+
+        kvui_prepare_keyed_song_destination(
+            &root, "Eagles", "Hotel California",
+            URL, -2, &destination
+        )
+        .unwrap();
+
+        assert!(destination.is_dir());
+
+        assert_eq!(
+            fs::read_to_string(
+                destination.join(KVUI_SONG_SOURCE_FILE)
+            )
+            .unwrap(),
+            URL
+        );
+
+        assert_eq!(select(&root, -2), destination);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protects_unmarked_key_folder() {
+        let root = temporary_root();
+
+        let occupied = root
+            .join("Eagles")
+            .join("Hotel California-2");
+
+        fs::create_dir_all(&occupied).unwrap();
+
+        fs::write(
+            occupied.join("Existing.mp3"),
+            b"preserve this file"
+        )
+        .unwrap();
+
+        let selected = select(&root, -2);
+
+        assert_ne!(selected, occupied);
+
+        assert!(
+            selected
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("[KV-")
+        );
+
+        assert_eq!(
+            fs::read(occupied.join("Existing.mp3")).unwrap(),
+            b"preserve this file"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_destination_changed_before_publishing() {
+        let root = temporary_root();
+        let destination = select(&root, -2);
+
+        fs::create_dir_all(&destination).unwrap();
+
+        fs::write(
+            destination.join(KVUI_SONG_SOURCE_FILE),
+            "https://example.test/other-recording"
+        )
+        .unwrap();
+
+        assert!(
+            kvui_prepare_keyed_song_destination(
+                &root, "Eagles", "Hotel California",
+                URL, -2, &destination
+            )
+            .is_err()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsupported_transposition() {
+        let root = temporary_root();
+
+        assert!(
+            kvui_select_keyed_song_destination(
+                &root, "Eagles", "Hotel California", URL, -5
+            )
+            .is_err()
+        );
+
+        assert!(
+            kvui_select_keyed_song_destination(
+                &root, "Eagles", "Hotel California", URL, 5
+            )
+            .is_err()
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
