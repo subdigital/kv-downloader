@@ -22,7 +22,8 @@ rpassword = "7.3.1"
 base64 = "0.22.1"
 dirs = "5.0"
 urlencoding = "2.1"
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "cookies"] }
+httpdate = "1.0"
 
 [dev-dependencies]
 tiny_http = "0.12.0"

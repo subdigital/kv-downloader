@@ -775,6 +775,7 @@ pub fn download_song_http(
 
     let mut failed_tracks = Vec::new();
     let mut downloaded_files: Vec<PathBuf> = Vec::new();
+    let mut accepted_etags = std::collections::HashSet::<String>::new();
     let mut challenge_refreshes = 0;
     let mut consecutive_failures = 0;
     let mut requested_any = false;
@@ -802,6 +803,7 @@ pub fn download_song_http(
 
         tracing::info!("Processing track {} '{}'", level_index, track_name);
 
+        let first_requested_at = SystemTime::now();
         let mut completed = false;
         for attempt in 1..=3 {
             tracing::info!("Attempt {}/3 for '{}'", attempt, track_name);
@@ -816,6 +818,7 @@ pub fn download_song_http(
                     options.count_in,
                     options.transpose,
                     &download_dir,
+                    first_requested_at,
                 ) {
                     Err(err) if err.downcast_ref::<ChallengeError>().is_some() => {
                         challenge_refreshes += 1;
@@ -835,7 +838,18 @@ pub fn download_song_http(
                 }
             };
             match result {
-                Ok((decoded, file_path)) => {
+                Ok((decoded, file_path, etag)) => {
+                    if http_etag_is_reused(&accepted_etags, etag.as_deref()) {
+                        tracing::warn!(
+                            "C22C-2 rejected '{}' because its server ETag matches a previously accepted instrument",
+                            decoded
+                        );
+                        let _ = std::fs::remove_file(&file_path);
+                        if attempt < 3 {
+                            retry_backoff(track_name, attempt);
+                        }
+                        continue;
+                    }
                     if let Some(previous) = downloaded_files
                         .iter()
                         .find(|previous| files_are_identical(previous, &file_path).unwrap_or(false))
@@ -854,6 +868,9 @@ pub fn download_song_http(
 
                     tracing::info!("Downloaded '{}'", decoded);
                     progress.mark_track_downloaded(track_name)?;
+                    if let Some(etag) = etag {
+                        accepted_etags.insert(etag);
+                    }
                     downloaded_files.push(file_path);
                     completed = true;
                     break;
@@ -910,7 +927,8 @@ fn download_http_track(
     count_in: bool,
     transpose: i8,
     download_dir: &std::path::Path,
-) -> Result<(String, PathBuf)> {
+    first_requested_at: SystemTime,
+) -> Result<(String, PathBuf, Option<String>)> {
     let trackslevels = song_meta.build_trackslevels_solo(level_index)?;
     if env::var("KV_HTTP_DEBUG").ok().as_deref() == Some("1") {
         tracing::info!(
@@ -940,7 +958,6 @@ fn download_http_track(
         .get(&basket_url)
         .timeout(Duration::from_secs(30))
         .query(&params)
-        .header("Cookie", cookie_header)
         .header("X-Requested-With", "XMLHttpRequest")
         .send()?
         .error_for_status()?;
@@ -955,7 +972,7 @@ fn download_http_track(
         song_meta.prod_id, song_meta.famid
     );
     tracing::info!("Waiting for '{}' to be prepared", track_name);
-    let file_url = poll_for_file_url(client, cookie_header, &begin_url)?;
+    let file_url = poll_for_file_url(client, cookie_header, &begin_url, track_name, transpose)?;
     let filename = file_url
         .split('/')
         .last()
@@ -966,8 +983,13 @@ fn download_http_track(
 
     let file_path = download_dir.join(&decoded);
     tracing::info!("Downloading '{}'", decoded);
-    download_file(client, &file_url, &file_path)?;
-    Ok((decoded, file_path))
+    let etag = download_file(
+        client,
+        &file_url,
+        &file_path,
+        first_requested_at,
+    )?;
+    Ok((decoded, file_path, etag))
 }
 
 fn files_are_identical(first: &std::path::Path, second: &std::path::Path) -> Result<bool> {
@@ -1035,9 +1057,19 @@ impl HttpSession {
     fn new(cookie_header: String, user_agent: &str, referer: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(REFERER, HeaderValue::from_str(referer)?);
+        let cookie_jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+        let cookie_origin = reqwest::Url::parse(referer)?.join("/")?;
+        for cookie in cookie_header
+            .split(';')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            cookie_jar.add_cookie_str(cookie, &cookie_origin);
+        }
         let client = Client::builder()
             .user_agent(user_agent)
             .default_headers(headers)
+            .cookie_provider(cookie_jar)
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(DOWNLOAD_COMPLETION_TIMEOUT_SECS))
             .build()?;
@@ -1052,7 +1084,6 @@ impl HttpSession {
             .client
             .get(url)
             .timeout(Duration::from_secs(30))
-            .header("Cookie", &self.cookie_header)
             .send()?
             .text()?)
     }
@@ -1590,7 +1621,72 @@ fn is_precount_track(value: &str) -> bool {
     normalized.contains("intro count") || normalized.contains("precount")
 }
 
-fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> Result<String> {
+fn http_href_matches_requested_track(
+    href: &str,
+    track_name: &str,
+    transpose: i8,
+) -> bool {
+    let path = href.split('?').next().unwrap_or(href);
+    let encoded_name = path.rsplit('/').next().unwrap_or("");
+
+    match urlencoding::decode(encoded_name) {
+        Ok(filename) => filename_matches_requested_track_key(
+            &filename,
+            track_name,
+            transpose,
+        ),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod c22c_http_link_tests {
+    use super::http_href_matches_requested_track as matches;
+
+    #[test]
+    fn accepts_requested_original_track() {
+        assert!(matches(
+            "https://example.test/America(Click_Custom_Backing_Track).mp3",
+            "Click",
+            0,
+        ));
+    }
+
+    #[test]
+    fn rejects_previous_instrument() {
+        assert!(!matches(
+            "https://example.test/America(Percussion_Custom_Backing_Track).mp3",
+            "Click",
+            0,
+        ));
+    }
+
+    #[test]
+    fn accepts_requested_positive_key() {
+        assert!(matches(
+            "https://example.test/America(Click_Custom_Backing_Track+2).mp3",
+            "Click",
+            2,
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_key() {
+        assert!(!matches(
+            "https://example.test/America(Click_Custom_Backing_Track).mp3",
+            "Click",
+            2,
+        ));
+    }
+}
+
+fn poll_for_file_url(
+    client: &Client,
+    _cookie_header: &str,
+    begin_url: &str,
+    track_name: &str,
+    transpose: i8,
+) -> Result<String> {
     let timeout = Duration::from_secs(120);
     let start = std::time::Instant::now();
     let produced_url = if begin_url.contains('?') {
@@ -1602,12 +1698,26 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
     let resp = client
         .get(begin_url)
         .timeout(Duration::from_secs(30))
-        .header("Cookie", cookie_header)
         .header("X-Requested-With", "XMLHttpRequest")
         .send()?;
 
     if let Some(file_href) = resp.headers().get("x-file-href") {
-        return Ok(file_href.to_str()?.to_string());
+        let candidate = file_href.to_str()?;
+
+        if http_href_matches_requested_track(candidate, track_name, transpose) {
+            tracing::info!(
+                "C22B readiness: stage=initial status={} file_ready=true elapsed_ms={}",
+                resp.status(),
+                start.elapsed().as_millis()
+            );
+            return Ok(candidate.to_string());
+        }
+
+        tracing::warn!(
+            "C22C link mismatch: stage=initial track='{}' key={}; waiting for correct link",
+            track_name,
+            transpose
+        );
     }
 
     let wait_url = resp
@@ -1618,6 +1728,7 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
     checked_text(resp)?;
 
     let mut last_wait_log = std::time::Instant::now();
+    let mut produced_polls: u32 = 0;
 
     loop {
         if last_wait_log.elapsed() >= Duration::from_secs(10) {
@@ -1634,7 +1745,6 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
             let wait_resp = client
                 .get(wait_full)
                 .timeout(Duration::from_secs(30))
-                .header("Cookie", cookie_header)
                 .header("X-Requested-With", "XMLHttpRequest")
                 .send()?;
             checked_text(wait_resp)?;
@@ -1643,12 +1753,29 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
         let resp = client
             .get(&produced_url)
             .timeout(Duration::from_secs(30))
-            .header("Cookie", cookie_header)
             .header("X-Requested-With", "XMLHttpRequest")
             .send()?;
 
+        produced_polls += 1;
         if let Some(file_href) = resp.headers().get("x-file-href") {
-            return Ok(file_href.to_str()?.to_string());
+            let candidate = file_href.to_str()?;
+
+            if http_href_matches_requested_track(candidate, track_name, transpose) {
+                tracing::info!(
+                    "C22B readiness: stage=produced status={} file_ready=true polls={} elapsed_ms={}",
+                    resp.status(),
+                    produced_polls,
+                    start.elapsed().as_millis()
+                );
+                return Ok(candidate.to_string());
+            }
+
+            tracing::warn!(
+                "C22C link mismatch: stage=produced track='{}' key={} poll={}; continuing",
+                track_name,
+                transpose,
+                produced_polls
+            );
         }
         checked_text(resp)?;
 
@@ -1659,8 +1786,106 @@ fn poll_for_file_url(client: &Client, cookie_header: &str, begin_url: &str) -> R
     }
 }
 
-fn download_file(client: &Client, url: &str, path: &PathBuf) -> Result<()> {
+fn http_server_file_is_fresh(
+    modified_at: SystemTime,
+    first_requested_at: SystemTime,
+) -> bool {
+    // HTTP timestamps have one-second precision.
+    // Allow a small margin for clock differences.
+    modified_at
+        .checked_add(Duration::from_secs(2))
+        .is_some_and(|time| time >= first_requested_at)
+}
+
+fn http_etag_is_reused(
+    accepted: &std::collections::HashSet<String>,
+    candidate: Option<&str>,
+) -> bool {
+    candidate.is_some_and(|etag| accepted.contains(etag))
+}
+
+#[cfg(test)]
+mod c22c2_freshness_tests {
+    use super::{http_etag_is_reused, http_server_file_is_fresh};
+    use std::collections::HashSet;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn rejects_old_server_file() {
+        let request = UNIX_EPOCH + Duration::from_secs(200);
+        let old_file = UNIX_EPOCH + Duration::from_secs(180);
+        assert!(!http_server_file_is_fresh(old_file, request));
+    }
+
+    #[test]
+    fn accepts_file_created_after_first_request() {
+        let request = UNIX_EPOCH + Duration::from_secs(200);
+        let new_file = UNIX_EPOCH + Duration::from_secs(205);
+        assert!(http_server_file_is_fresh(new_file, request));
+    }
+
+    #[test]
+    fn retry_uses_original_request_time() {
+        let first_request = UNIX_EPOCH + Duration::from_secs(200);
+        let completed_file = UNIX_EPOCH + Duration::from_secs(205);
+        // A subsequent retry may start after second 205.
+        assert!(http_server_file_is_fresh(
+            completed_file,
+            first_request
+        ));
+    }
+
+    #[test]
+    fn rejects_reused_etag() {
+        let mut accepted = HashSet::new();
+        accepted.insert("previous-version".to_string());
+
+        assert!(http_etag_is_reused(
+            &accepted,
+            Some("previous-version")
+        ));
+
+        assert!(!http_etag_is_reused(
+            &accepted,
+            Some("new-version")
+        ));
+
+        assert!(!http_etag_is_reused(&accepted, None));
+    }
+}
+fn download_file(
+    client: &Client,
+    url: &str,
+    path: &PathBuf,
+    first_requested_at: SystemTime,
+) -> Result<Option<String>> {
+    let response_started = std::time::Instant::now();
     let mut resp = client.get(url).send()?;
+
+    // An MP3 download must return a complete, successful response.
+    if resp.status() != reqwest::StatusCode::OK {
+        return Err(anyhow!(
+            "Unexpected HTTP status {} while downloading MP3",
+            resp.status()
+        ));
+    }
+
+    let response_ms = response_started.elapsed().as_millis();
+    let headers = resp.headers();
+    let etag = headers.get("etag").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let modified = headers.get("last-modified").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let server_date = headers.get("date").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    let length = headers.get("content-length").and_then(|v| v.to_str().ok()).unwrap_or("-");
+    tracing::info!(
+        "C22B MP3 response: file={} status={} response_ms={} etag={} last_modified={} server_date={} content_length={}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>"),
+        resp.status(),
+        response_ms,
+        etag,
+        modified,
+        server_date,
+        length
+    );
     let is_html = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1670,9 +1895,38 @@ fn download_file(client: &Client, url: &str, path: &PathBuf) -> Result<()> {
         checked_text(resp)?;
         return Err(anyhow!("Expected an MP3 but the server returned a web page"));
     }
+    let modified_header = resp
+        .headers()
+        .get("last-modified")
+        .ok_or_else(|| anyhow!(
+            "C22C-2 cannot verify MP3 freshness: Last-Modified is missing"
+        ))?
+        .to_str()?;
+
+    let modified_at = httpdate::parse_http_date(modified_header)
+        .map_err(|err| anyhow!(
+            "C22C-2 cannot parse server Last-Modified: {}",
+            err
+        ))?;
+
+    if !http_server_file_is_fresh(modified_at, first_requested_at) {
+        tracing::warn!(
+            "C22C-2 rejected stale MP3: server Last-Modified predates the original instrument request"
+        );
+        return Err(anyhow!(
+            "C22C-2 server file is stale relative to original request"
+        ));
+    }
+
+    let accepted_etag = resp
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
     let mut file = std::fs::File::create(path)?;
     std::io::copy(&mut resp, &mut file)?;
-    Ok(())
+    Ok(accepted_etag)
 }
 
 #[cfg(test)]
