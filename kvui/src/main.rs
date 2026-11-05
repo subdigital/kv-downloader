@@ -1625,9 +1625,10 @@ fn prepare_staged_download(
             &staging_dir,
         )?;
 
-        tasks::download_song::verify_staged_tracks(
+        tasks::download_song::verify_staged_tracks_for_key(
             &staging_dir,
             &selected_tracks,
+            transpose,
         )
     })();
 

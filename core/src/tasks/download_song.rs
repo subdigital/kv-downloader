@@ -1300,10 +1300,68 @@ fn browser_filename_matches_track(filename: &str, track_name: &str) -> bool {
         return false;
     }
 
-    let suffix = format!("({slug}_Custom_Backing_Track).mp3");
-    filename.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase())
+    let suffix = format!("({slug}_Custom_Backing_Track");
+    let filename = filename.to_ascii_lowercase();
+    let suffix = suffix.to_ascii_lowercase();
+
+    let Some(body) = filename.strip_suffix(").mp3") else {
+        return false;
+    };
+
+    // Original-key download.
+    if body.ends_with(&suffix) {
+        return true;
+    }
+
+    // Transposed versions: -1 through -4 and positive shifts.
+    // Restrict the accepted values to KVUI's supported range.
+    (-4..=-1)
+        .chain(1..=4)
+        .any(|shift| body.ends_with(&format!("{suffix}{shift}")))
+        || (1..=4)
+            .any(|shift| body.ends_with(&format!("{suffix}+{shift}")))
 }
 
+
+/// Verify both the requested instrument and transposition.
+///
+/// The original-key filename has no numeric key suffix.
+/// Transposed versions must have the requested semitone suffix.
+#[allow(dead_code)]
+fn filename_matches_requested_track_key(
+    filename: &str,
+    track_name: &str,
+    transpose: i8,
+) -> bool {
+    if !(-4..=4).contains(&transpose) {
+        return false;
+    }
+
+    // Preserve the existing instrument-name checks.
+    if !browser_filename_matches_track(filename, track_name) {
+        return false;
+    }
+
+    let lower = filename.to_ascii_lowercase();
+
+    let Some(body) = lower.strip_suffix(").mp3") else {
+        return false;
+    };
+
+    let marker = "_custom_backing_track";
+
+    if transpose == 0 {
+        return body.ends_with(marker);
+    }
+
+    if transpose < 0 {
+        return body.ends_with(&format!("{marker}{transpose}"));
+    }
+
+    // Accept either positive-key suffix form.
+    body.ends_with(&format!("{marker}{transpose}"))
+        || body.ends_with(&format!("{marker}+{transpose}"))
+}
 fn file_was_newly_downloaded(
     file_length: u64,
     modified_at: SystemTime,
@@ -1912,6 +1970,15 @@ pub fn verify_staged_tracks(
     staging_dir: &std::path::Path,
     selected_tracks: &[String],
 ) -> Result<Vec<PathBuf>> {
+    verify_staged_tracks_for_key(staging_dir, selected_tracks, 0)
+}
+
+/// Verify selected tracks against the exact requested key.
+pub fn verify_staged_tracks_for_key(
+    staging_dir: &std::path::Path,
+    selected_tracks: &[String],
+    transpose: i8,
+) -> Result<Vec<PathBuf>> {
     if selected_tracks.is_empty() {
         return Err(anyhow!("No tracks selected"));
     }
@@ -1951,7 +2018,7 @@ pub fn verify_staged_tracks(
         let matches = files.iter().filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| browser_filename_matches_track(name, track))
+                .is_some_and(|name| filename_matches_requested_track_key(name, track, transpose))
         }).count();
 
         if matches != 1 {
@@ -2599,5 +2666,221 @@ mod staging_cleanup_tests {
         assert!(unrelated.exists());
 
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod transposed_filename_tests {
+    use super::browser_filename_matches_track;
+
+    #[test]
+    fn accepts_original_key() {
+        assert!(browser_filename_matches_track(
+            "Eagles_Hotel_California(Bass_Custom_Backing_Track).mp3",
+            "Bass"
+        ));
+    }
+
+    #[test]
+    fn accepts_negative_transpositions() {
+        for shift in 1..=4 {
+            let filename = format!(
+                "Eagles_Hotel_California(Bass_Custom_Backing_Track-{shift}).mp3"
+            );
+
+            assert!(browser_filename_matches_track(
+                &filename, "Bass"
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_positive_transposition_suffixes() {
+        for shift in 1..=4 {
+            let signed = format!(
+                "Eagles_Hotel_California(Bass_Custom_Backing_Track+{shift}).mp3"
+            );
+
+            let unsigned = format!(
+                "Eagles_Hotel_California(Bass_Custom_Backing_Track{shift}).mp3"
+            );
+
+            assert!(browser_filename_matches_track(&signed, "Bass"));
+            assert!(browser_filename_matches_track(&unsigned, "Bass"));
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_instruments() {
+        assert!(!browser_filename_matches_track(
+            "Eagles_Hotel_California(Synth_Bass_Custom_Backing_Track-2).mp3",
+            "Bass"
+        ));
+
+        assert!(!browser_filename_matches_track(
+            "Eagles_Hotel_California(Bass_Custom_Backing_Track-2).mp3",
+            "Drums"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_transposition_suffixes() {
+        for filename in [
+            "Song(Bass_Custom_Backing_Track-9).mp3",
+            "Song(Bass_Custom_Backing_Track--2).mp3",
+            "Song(Bass_Custom_Backing_Track+0).mp3",
+            "Song(Bass_Custom_Backing_Track-2).wav",
+            "Song(Bass_Custom_Backing_Track-2.mp3",
+            "Song(Bass_Custom_Backing_Track-abc).mp3",
+        ] {
+            assert!(!browser_filename_matches_track(filename, "Bass"));
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod exact_key_filename_tests {
+    use super::filename_matches_requested_track_key;
+
+    #[test]
+    fn accepts_original_key_only_when_requested() {
+        let file =
+            "Eagles_Hotel_California(Bass_Custom_Backing_Track).mp3";
+
+        assert!(filename_matches_requested_track_key(file, "Bass", 0));
+        assert!(!filename_matches_requested_track_key(file, "Bass", -2));
+        assert!(!filename_matches_requested_track_key(file, "Bass", 2));
+    }
+
+    #[test]
+    fn accepts_exact_negative_key() {
+        let file =
+            "Eagles_Hotel_California(Bass_Custom_Backing_Track-2).mp3";
+
+        assert!(filename_matches_requested_track_key(file, "Bass", -2));
+        assert!(!filename_matches_requested_track_key(file, "Bass", 0));
+        assert!(!filename_matches_requested_track_key(file, "Bass", -3));
+        assert!(!filename_matches_requested_track_key(file, "Bass", 2));
+    }
+
+    #[test]
+    fn accepts_exact_positive_key() {
+        let unsigned =
+            "Song(Bass_Custom_Backing_Track2).mp3";
+
+        let signed =
+            "Song(Bass_Custom_Backing_Track+2).mp3";
+
+        assert!(filename_matches_requested_track_key(
+            unsigned, "Bass", 2
+        ));
+
+        assert!(filename_matches_requested_track_key(
+            signed, "Bass", 2
+        ));
+
+        assert!(!filename_matches_requested_track_key(
+            unsigned, "Bass", 3
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_instrument_even_with_correct_key() {
+        assert!(!filename_matches_requested_track_key(
+            "Song(Drums_Custom_Backing_Track-2).mp3",
+            "Bass",
+            -2
+        ));
+
+        assert!(!filename_matches_requested_track_key(
+            "Song(Synth_Bass_Custom_Backing_Track-2).mp3",
+            "Bass",
+            -2
+        ));
+    }
+
+    #[test]
+    fn checks_all_supported_negative_keys() {
+        for shift in -4..=-1 {
+            let file = format!(
+                "Song(Bass_Custom_Backing_Track{shift}).mp3"
+            );
+
+            assert!(filename_matches_requested_track_key(
+                &file, "Bass", shift
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_key_values_and_suffixes() {
+        assert!(!filename_matches_requested_track_key(
+            "Song(Bass_Custom_Backing_Track-5).mp3",
+            "Bass",
+            -5
+        ));
+
+        assert!(!filename_matches_requested_track_key(
+            "Song(Bass_Custom_Backing_Track-2).mp3",
+            "Bass",
+            5
+        ));
+
+        assert!(!filename_matches_requested_track_key(
+            "Song(Bass_Custom_Backing_Track-2).wav",
+            "Bass",
+            -2
+        ));
+    }
+}
+
+
+#[cfg(test)]
+mod exact_key_staging_tests {
+    use super::verify_staged_tracks_for_key;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn accepts_requested_key_and_rejects_other_keys() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let dir = std::env::temp_dir().join(format!(
+            "kvui-c19-staging-{}-{unique}",
+            std::process::id()
+        ));
+
+        fs::create_dir_all(&dir).unwrap();
+
+        let filename =
+            "Eagles_Hotel_California(Bass_Custom_Backing_Track-2).mp3";
+
+        fs::write(dir.join(filename), b"test audio").unwrap();
+
+        let bass = vec!["Bass".to_string()];
+
+        assert_eq!(
+            verify_staged_tracks_for_key(&dir, &bass, -2)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert!(
+            verify_staged_tracks_for_key(&dir, &bass, -3)
+                .is_err()
+        );
+
+        assert!(
+            verify_staged_tracks_for_key(&dir, &bass, 0)
+                .is_err()
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
